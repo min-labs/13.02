@@ -766,9 +766,9 @@ impl Assembler {
 }
 
 // ============================================================================
-// SPRINT 3: SIMD ChaCha20-Poly1305 AEAD via `ring` (BoringSSL asm)
-// AVX2/AVX-512 accelerated. ~1.7 GiB/s vs ~200 MiB/s scalar = 4-8x speedup.
-// Wire format unchanged: same nonce, AAD, tag layout as RFC 8439.
+// SPRINT 3: AES-256-GCM AEAD via `ring` (BoringSSL asm)
+// x86: AES-NI hw accel (~4-10 GiB/s). ARM A53 (K26): ARMv8 Crypto Extensions.
+// Future: FPGA AES-GCM IP core for line-rate offload. Wire format unchanged.
 // ============================================================================
 
 use ring::aead;
@@ -781,7 +781,7 @@ fn seal_frame(frame: &mut [u8], key: &[u8; 32], seq: u64, direction: u8, offset:
     frame[sig+2] = 0x01; frame[sig+3] = 0x00;
     frame[sig+20..sig+32].copy_from_slice(&nonce_bytes);
     let pt = sig + 32;
-    let ukey = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, key).unwrap();
+    let ukey = aead::UnboundKey::new(&aead::AES_256_GCM, key).unwrap();
     let lsk = aead::LessSafeKey::new(ukey);
     let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
     let aad_bytes: [u8; 4] = frame[sig..sig+4].try_into().unwrap();
@@ -800,7 +800,7 @@ fn open_frame(frame: &mut [u8], key: &[u8; 32], our_dir: u8, offset: usize) -> b
     let mut wire_tag_bytes = [0u8; 16];
     wire_tag_bytes.copy_from_slice(&frame[sig+4..sig+20]);
     let pt = sig + 32;
-    let ukey = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, key).unwrap();
+    let ukey = aead::UnboundKey::new(&aead::AES_256_GCM, key).unwrap();
     let lsk = aead::LessSafeKey::new(ukey);
     let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
     let aad_bytes: [u8; 4] = frame[sig..sig+4].try_into().unwrap();
