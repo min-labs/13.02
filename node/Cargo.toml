@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 libc = "0.2"
+ring = "0.17"              # BoringSSL asm: AVX2/AVX-512 ChaCha20-Poly1305 (Sprint 3)
 libbpf-sys = "0.6.0-1"
 bytemuck = { version = "1.14", features = ["derive"] }
 
