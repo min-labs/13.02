@@ -290,6 +290,8 @@ fn seal_frame(frame: &mut [u8], lsk: &aead::LessSafeKey, seq: u64, direction: u8
 }
 
 /// Open (verify+decrypt) an M13 frame in-place. Returns true if authentic.
+/// Sprint 4: Removed redundant seq double-check — AEAD tag already guarantees
+/// integrity of the plaintext (including the seq field).
 fn open_frame(frame: &mut [u8], lsk: &aead::LessSafeKey, our_dir: u8) -> bool {
     let sig = ETH_HDR_SIZE;
     if frame.len() < sig + 32 + 8 { return false; }
@@ -304,14 +306,7 @@ fn open_frame(frame: &mut [u8], lsk: &aead::LessSafeKey, our_dir: u8) -> bool {
     let aad_bytes: [u8; 4] = frame[sig..sig+4].try_into().unwrap();
     let aad = aead::Aad::from(&aad_bytes);
     let tag = aead::Tag::from(wire_tag_bytes);
-    match lsk.open_in_place_separate_tag(nonce, aad, tag, &mut frame[pt..], 0..) {
-        Ok(_) => {
-            let dec_seq = u64::from_le_bytes(frame[pt..pt+8].try_into().unwrap());
-            let nonce_seq = u64::from_le_bytes(nonce_bytes[0..8].try_into().unwrap());
-            dec_seq == nonce_seq
-        }
-        Err(_) => false,
-    }
+    lsk.open_in_place_separate_tag(nonce, aad, tag, &mut frame[pt..], 0..).is_ok()
 }
 
 // ============================================================================
@@ -947,6 +942,42 @@ fn setup_tunnel_routes(hub_ip: &str) {
         .output();
     eprintln!("[M13-ROUTE] ✓ IPv6 disabled (leak prevention)");
 
+    // 4. TCP BDP tuning — tunnel adds RTT, raise TCP buffer ceiling
+    // Browser TCP connections see the full tunnel RTT. Default rmem_max=208KB
+    // limits throughput to ~8Mbps at 200ms RTT. Raise to 16MB.
+    let _ = std::process::Command::new("sysctl")
+        .args(&["-w", "net.core.rmem_max=16777216"]).output();
+    let _ = std::process::Command::new("sysctl")
+        .args(&["-w", "net.core.wmem_max=16777216"]).output();
+    let _ = std::process::Command::new("sysctl")
+        .args(&["-w", "net.ipv4.tcp_rmem=4096 1048576 16777216"]).output();
+    let _ = std::process::Command::new("sysctl")
+        .args(&["-w", "net.ipv4.tcp_wmem=4096 1048576 16777216"]).output();
+    let _ = std::process::Command::new("sysctl")
+        .args(&["-w", "net.ipv4.tcp_slow_start_after_idle=0"]).output();
+    let _ = std::process::Command::new("sysctl")
+        .args(&["-w", "net.ipv4.tcp_window_scaling=1"]).output();
+
+    // 5. Enable forwarding + MSS clamping + firewall rules
+    let _ = std::process::Command::new("sysctl")
+        .args(&["-w", "net.ipv4.ip_forward=1"]).output();
+
+    // TCP MSS clamping: TUN MTU=1400, so MSS must be ≤ 1360 (1400-40).
+    // Without this, TCP negotiates MSS=1460 (based on remote 1500 MTU),
+    // causing PMTUD blackhole → throughput collapses to ~5 Mbps.
+    let _ = std::process::Command::new("iptables")
+        .args(&["-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"]).output();
+    let _ = std::process::Command::new("iptables")
+        .args(&["-A", "FORWARD", "-i", "m13tun0", "-j", "ACCEPT"]).output();
+    let _ = std::process::Command::new("iptables")
+        .args(&["-A", "FORWARD", "-o", "m13tun0", "-j", "ACCEPT"]).output();
+
+    // 6. TUN qdisc: fq (fair queueing) — absorbs bursts + paces TCP.
+    // noqueue drops instantly when reader can't keep up; fq is production-grade.
+    let _ = std::process::Command::new("tc")
+        .args(&["qdisc", "replace", "dev", "m13tun0", "root", "fq"]).output();
+    eprintln!("[M13-ROUTE] ✓ TCP BDP tuned + MSS clamped + TUN qdisc=fq");
+
     eprintln!("[M13-ROUTE] Tunnel routing active. All IPv4 traffic → m13tun0");
 
 
@@ -971,6 +1002,23 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
     unsafe {
         let flags = libc::fcntl(raw_fd, libc::F_GETFL);
         libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+
+        // Sprint 4d: Socket buffer tuning — prevent burst drops.
+        // Hub sends via AF_XDP at wire speed (bursts of 64+ packets per tick).
+        // Default SO_RCVBUF (~208KB) overflows → silent UDP drops → TCP loss
+        // → cwnd collapse → stall → slow start → "ticking" behavior.
+        // 4MB absorbs ~2700 packets of burst at 1500B each.
+        let buf_sz: libc::c_int = 4 * 1024 * 1024; // 4MB
+        libc::setsockopt(
+            raw_fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+            &buf_sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        libc::setsockopt(
+            raw_fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+            &buf_sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
 
     // Extract Hub IP (without port) for routing
@@ -1023,6 +1071,26 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
     let mut tx_iovecs: [libc::iovec; TUN_BATCH] = unsafe { std::mem::zeroed() };
     let mut tx_msgs: [libc::mmsghdr; TUN_BATCH] = unsafe { std::mem::zeroed() };
 
+    // === Sprint 4: Header template — stamp static fields once, copy per-packet ===
+    // Avoids per-packet fill(0) of 30-byte signature region + 6 field writes.
+    let mut hdr_template = [0u8; 62];
+    hdr_template[0..6].copy_from_slice(&hub_mac);
+    hdr_template[6..12].copy_from_slice(&src_mac);
+    hdr_template[12] = (ETH_P_M13 >> 8) as u8;
+    hdr_template[13] = (ETH_P_M13 & 0xFF) as u8;
+    hdr_template[14] = M13_WIRE_MAGIC;
+    hdr_template[15] = M13_WIRE_VERSION;
+    // bytes 16..62 already 0 from array init
+
+    // === Sprint 4b: Deferred TUN write batch arrays ===
+    // Gather-defer-flush: collect (rx_index, start, len) during RX classify,
+    // flush all TUN writes in a tight sequential loop AFTER classify completes.
+    // Eliminates syscall/classify interleaving — keeps L1d cache hot.
+    const TUN_WR_BATCH: usize = 64; // matches RX_BATCH
+    let mut tun_wr_indices: [u8; TUN_WR_BATCH] = [0; TUN_WR_BATCH];
+    let mut tun_wr_starts: [u16; TUN_WR_BATCH] = [0; TUN_WR_BATCH];
+    let mut tun_wr_lens: [u16; TUN_WR_BATCH] = [0; TUN_WR_BATCH];
+
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) { break; }
         let now = rdtsc_ns(&cal);
@@ -1042,6 +1110,7 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
                            libc::MSG_DONTWAIT, std::ptr::null_mut())
         };
         let rx_batch_count = if rx_n > 0 { rx_n as usize } else { 0 };
+        let mut tun_wr_count: usize = 0; // reset per tick
         for rx_i in 0..rx_batch_count {
             let len = rx_msgs[rx_i].msg_len as usize;
             let buf = &mut rx_bufs[rx_i][..len];
@@ -1168,14 +1237,17 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
                     } else if flags & FLAG_CONTROL != 0 {
                         // Control frame — handled
                     } else if flags & FLAG_TUNNEL != 0 {
-                        // Tunnel frame: payload is IP packet
-                        // Decryption already verified by AEAD gate above
-                        if let Some(ref mut tun_file) = tun {
+                        // Sprint 4b: Deferred TUN write — collect, don't write.
+                        // Actual write() happens after the classify loop exits.
+                        if tun.is_some() {
                             let start = ETH_HDR_SIZE + M13_HDR_SIZE;
                             let plen_bytes = &buf[55..59];
                             let plen = u32::from_le_bytes(plen_bytes.try_into().unwrap()) as usize;
-                            if start + plen <= len {
-                                let _ = tun_file.write(&buf[start..start+plen]);
+                            if start + plen <= len && tun_wr_count < TUN_WR_BATCH {
+                                tun_wr_indices[tun_wr_count] = rx_i as u8;
+                                tun_wr_starts[tun_wr_count] = start as u16;
+                                tun_wr_lens[tun_wr_count] = plen as u16;
+                                tun_wr_count += 1;
                             }
                         }
                     } else if echo && matches!(state, NodeState::Established { .. }) {
@@ -1192,6 +1264,20 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
                             if sock.send(&echo_frame).is_ok() { tx_count += 1; }
                         }
                     }
+                }
+            }
+        }
+
+        // === Sprint 4b: Deferred TUN write flush ===
+        // All tunnel packets collected during classify are written here.
+        // Tight sequential loop — cache-friendly, branch-predictor-friendly.
+        if tun_wr_count > 0 {
+            if let Some(ref mut tun_file) = tun {
+                for ti in 0..tun_wr_count {
+                    let ri = tun_wr_indices[ti] as usize;
+                    let s = tun_wr_starts[ti] as usize;
+                    let l = tun_wr_lens[ti] as usize;
+                    let _ = tun_file.write(&rx_bufs[ri][s..s + l]);
                 }
             }
         }
@@ -1244,21 +1330,13 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
                     // Zero-copy TUN → tx_buf: read directly into payload region (offset 62)
                     match tun_file.read(&mut frame[62..1562]) {
                         Ok(n) if n > 0 => {
-                            // Stamp M13 header in-place (no intermediate build_m13_frame copy)
-                            frame[0..6].copy_from_slice(&hub_mac);
-                            frame[6..12].copy_from_slice(&src_mac);
-                            frame[12] = (ETH_P_M13 >> 8) as u8;
-                            frame[13] = (ETH_P_M13 & 0xFF) as u8;
-                            frame[14] = M13_WIRE_MAGIC;
-                            frame[15] = M13_WIRE_VERSION;
-                            // Zero signature bytes 16..46
-                            frame[16..46].fill(0);
+                            // Sprint 4: Copy pre-built header template (static 46 bytes)
+                            // then stamp only the 3 variable fields (seq, flags, payload_len).
+                            frame[0..46].copy_from_slice(&hdr_template[0..46]);
                             frame[46..54].copy_from_slice(&seq_tx.to_le_bytes());
                             frame[54] = FLAG_TUNNEL;
-                            // Payload length
                             frame[55..59].copy_from_slice(&(n as u32).to_le_bytes());
-                            // Pad remaining header bytes
-                            frame[59..62].fill(0);
+                            frame[59..62].copy_from_slice(&hdr_template[59..62]);
 
                             // Encrypt
                             let flen = 62 + n;
@@ -1802,6 +1880,13 @@ fn teardown_tunnel_routes(hub_ip: &str) {
     let _ = std::process::Command::new("sysctl")
         .args(&["-w", "net.ipv6.conf.default.disable_ipv6=0"])
         .output();
+    // Remove iptables rules
+    let _ = std::process::Command::new("iptables")
+        .args(&["-D", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"]).output();
+    let _ = std::process::Command::new("iptables")
+        .args(&["-D", "FORWARD", "-i", "m13tun0", "-j", "ACCEPT"]).output();
+    let _ = std::process::Command::new("iptables")
+        .args(&["-D", "FORWARD", "-o", "m13tun0", "-j", "ACCEPT"]).output();
     eprintln!("[M13-ROUTE] ✓ Routes restored, IPv6 re-enabled");
 }
 
@@ -1861,10 +1946,12 @@ fn create_tun(name: &str) -> Option<std::fs::File> {
     // Set interface up and assign IP (Node = 10.13.0.2/24)
     let _ = std::process::Command::new("ip").args(&["link", "set", "dev", name, "up"]).output();
     let _ = std::process::Command::new("ip").args(&["addr", "add", "10.13.0.2/24", "dev", name]).output();
-    // Start with 1280 MTU (safe for M13 1500B frame)
-    let _ = std::process::Command::new("ip").args(&["link", "set", "dev", name, "mtu", "1280"]).output();
+    // MTU 1400: max safe for Hub raw frame (1500-104=1396), Node UDP (1472-62=1410)
+    let _ = std::process::Command::new("ip").args(&["link", "set", "dev", name, "mtu", "1400"]).output();
+    // txqueuelen 1000: prevent kernel TUN queue drops at burst rates
+    let _ = std::process::Command::new("ip").args(&["link", "set", "dev", name, "txqueuelen", "1000"]).output();
 
-    eprintln!("[M13-TUN] Created tunnel interface {} (10.13.0.2/24)", name);
+    eprintln!("[M13-TUN] Created tunnel interface {} (10.13.0.2/24, MTU 1400)", name);
     Some(file)
 }
 

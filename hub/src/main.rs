@@ -39,782 +39,49 @@ use std::process::Command;
 use std::marker::PhantomData;
 use std::collections::HashMap;
 
-// Sprint 6.2: PQC cold-path imports (handshake only — never in hot loop)
-use sha2::{Sha512, Digest};
-use hkdf::Hkdf;
-use rand::rngs::OsRng;
+// ============================================================================
+// VPP LIBRARY IMPORTS — canonical source of truth for all extracted modules
+// ============================================================================
+use m13_hub::protocol::wire::{FLAG_CONTROL, FLAG_FEEDBACK, FLAG_TUNNEL, FLAG_ECN, FLAG_FIN,
+    FLAG_HANDSHAKE, FLAG_FRAGMENT, HS_CLIENT_HELLO, HS_SERVER_HELLO, HS_FINISHED,
+    DIR_HUB_TO_NODE, REKEY_FRAME_LIMIT, REKEY_TIME_LIMIT_NS,
+    FragHeader, FRAG_HDR_SIZE};
+use m13_hub::protocol::peer::{PeerTable, PeerAddr, PeerSlot, PeerLifecycle, MAX_PEERS, TUNNEL_SUBNET};
+use m13_hub::protocol::fragment::Assembler;
+use m13_hub::crypto::aead::{seal_frame, open_frame};
+use m13_hub::crypto::pqc::{HubHandshakeState, process_client_hello_hub, process_finished_hub,
+    build_fragmented_raw_udp as build_fragmented_raw_udp_nohex};
+use m13_hub::engine::clock::{TscCal, calibrate_tsc, rdtsc_ns, clock_ns, prefetch_read_l1};
+use m13_hub::engine::scheduler::{Scheduler, TxSubmit, TxCounter, TxDesc,
+    TX_RING_SIZE, HW_FILL_MAX};
+use m13_hub::engine::jitter::{JitterBuffer, measure_epsilon_proc, JBUF_CAPACITY};
+use m13_hub::engine::rx_state::{RxBitmap, ReceiverState, FEEDBACK_INTERVAL_PKTS, FEEDBACK_RTT_DEFAULT_NS};
+use m13_hub::tunnel::net::{build_raw_udp_frame, ip_checksum, detect_mac, resolve_gateway_mac,
+    get_interface_ip, RAW_HDR_LEN, IP_HDR_LEN, UDP_HDR_LEN};
 
-// Sprint 6.3: PQC handshake — ML-KEM-1024 key exchange + ML-DSA-87 mutual auth
-use ml_kem::EncodedSizeUser;
-use ml_kem::kem::Encapsulate;
-use ml_dsa::{MlDsa87, KeyGen};
+use sha2::Sha512;
+use hkdf::Hkdf;
+
+use ring::aead;
 
 const SLAB_DEPTH: usize = 8192;
-
 const GRAPH_BATCH: usize = 256;
-const FLAG_CONTROL: u8  = 0x80;
-const FLAG_FEEDBACK: u8 = 0x40;
-const FLAG_TUNNEL: u8   = 0x20;
-const FLAG_ECN: u8      = 0x10;  // Receiver signals congestion (Sprint 5.19)
-const FLAG_FIN: u8      = 0x08;  // Graceful close signal (Sprint 5.21)
-// FLAG_FEC (0x04) reserved for Sprint 6.7 RLNC — not yet implemented
-const FLAG_HANDSHAKE: u8= 0x02;  // Handshake control (Sprint 6.3)
-const FLAG_FRAGMENT: u8 = 0x01;  // Fragmented message (Sprint 6.1)
-
-// Sprint 6.2: PQC handshake sub-types
-const HS_CLIENT_HELLO: u8 = 0x01;
-const HS_SERVER_HELLO: u8 = 0x02;
-const HS_FINISHED: u8     = 0x03;
-// Direction bytes for AEAD nonce (prevents reflection attacks)
-const DIR_HUB_TO_NODE: u8 = 0x00;
-
-// Rekey thresholds
-const REKEY_FRAME_LIMIT: u64 = 1u64 << 32;
-const REKEY_TIME_LIMIT_NS: u64 = 3_600_000_000_000;
-
 const ETH_HDR_SIZE: usize = mem::size_of::<EthernetHeader>();
 const M13_HDR_SIZE: usize = mem::size_of::<M13Header>();
 const FEEDBACK_FRAME_LEN: u32 = (ETH_HDR_SIZE + M13_HDR_SIZE + mem::size_of::<FeedbackFrame>()) as u32;
 const DEADLINE_NS: u64 = 50_000;
 const PREFETCH_DIST: usize = 4;
-const TX_RING_SIZE: usize = 2048;
-const HW_FILL_MAX: usize = TX_RING_SIZE / 10;
-
-const FEEDBACK_INTERVAL_PKTS: u32 = 32;
-const FEEDBACK_RTT_DEFAULT_NS: u64 = 10_000_000; // 10ms until first RTprop sample
-
 const SEQ_WINDOW: usize = 131_072; // 2^17
 const _: () = assert!(SEQ_WINDOW & (SEQ_WINDOW - 1) == 0);
 
-#[inline(always)]
-fn clock_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+/// Bridge: ZeroCopyTx (datapath.rs TxPath) → lib Scheduler's TxSubmit trait.
+impl TxSubmit for ZeroCopyTx {
+    fn available_slots(&mut self) -> u32 { TxPath::available_slots(self) }
+    fn stage_tx_addr(&mut self, addr: u64, len: u32) { TxPath::stage_tx_addr(self, addr, len) }
+    fn commit_tx(&mut self) { TxPath::commit_tx(self) }
+    fn kick_tx(&mut self) { TxPath::kick_tx(self) }
 }
 
-// ============================================================================
-// SPRINT 5.17: TSC FAST CLOCK
-// Replaces clock_gettime(MONOTONIC) in the hot loop with raw rdtsc.
-// Calibrated at boot against CLOCK_MONOTONIC. Fixed-point multiply+shift
-// conversion — identical method to Linux kernel (arch/x86/kernel/tsc.c).
-// ============================================================================
-
-/// TSC-to-nanosecond calibration data. Computed once at boot, immutable after.
-/// Conversion: ns = mono_base + ((rdtsc() - tsc_base) * mult) >> shift
-/// The mult/shift pair encodes ns_per_tsc_tick as a fixed-point fraction.
-#[derive(Clone, Copy)]
-struct TscCal {
-    tsc_base: u64,   // rdtsc value at calibration instant
-    mono_base: u64,  // CLOCK_MONOTONIC (ns) at same instant
-    mult: u32,       // fixed-point multiplier
-    shift: u32,      // right-shift amount (typically 32)
-    valid: bool,     // false if TSC is unreliable (VM, non-invariant)
-}
-
-impl TscCal {
-    /// Fallback calibration — rdtsc_ns() will call clock_ns() instead.
-    fn fallback() -> Self {
-        TscCal { tsc_base: 0, mono_base: 0, mult: 0, shift: 0, valid: false }
-    }
-}
-
-/// Raw TSC read. ~24 cycles on Skylake (~6.5ns at 3.7GHz).
-/// No serialization (lfence/rdtscp) — not needed for "what time is it?" queries.
-/// OoO reordering error is ±2ns, irrelevant for 50µs deadlines.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn read_tsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
-    ((hi as u64) << 32) | (lo as u64)
-}
-
-/// ARM equivalent: CNTVCT_EL0 (generic timer virtual count).
-/// Constant-rate, monotonic, unprivileged. Same calibration math applies.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn read_tsc() -> u64 {
-    let cnt: u64;
-    unsafe {
-        core::arch::asm!(
-            "mrs {cnt}, CNTVCT_EL0",
-            cnt = out(reg) cnt,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
-    cnt
-}
-
-/// Fallback for non-x86/ARM: just use clock_gettime.
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-#[inline(always)]
-fn read_tsc() -> u64 { clock_ns() }
-
-/// Convert raw TSC value to nanoseconds using pre-computed calibration.
-/// Hot path: 1 subtract + 1 multiply (u128) + 1 shift + 1 add = ~5 cycles.
-/// Total with rdtsc: ~29 cycles = ~7.8ns at 3.7GHz.
-/// Compare: clock_gettime vDSO = ~41 cycles = ~11-25ns.
-#[inline(always)]
-fn rdtsc_ns(cal: &TscCal) -> u64 {
-    if !cal.valid { return clock_ns(); }
-    let delta = read_tsc().wrapping_sub(cal.tsc_base);
-    cal.mono_base.wrapping_add(
-        ((delta as u128 * cal.mult as u128) >> cal.shift) as u64
-    )
-}
-
-/// Two-point TSC calibration against CLOCK_MONOTONIC.
-/// Runs for 100ms, comparing rdtsc deltas against kernel clock deltas.
-/// Computes fixed-point mult/shift such that:
-///   ns_per_tick = mult / 2^shift
-/// After calibration, validates accuracy over 1000 samples.
-/// Returns TscCal::fallback() if TSC is unreliable.
-fn calibrate_tsc() -> TscCal {
-    // Check invariant TSC support (CPUID leaf 0x80000007, bit 8)
-    #[cfg(target_arch = "x86_64")]
-    {
-        let has_invariant_tsc = unsafe {
-            let result: u32;
-            core::arch::asm!(
-                "push rbx",
-                "mov eax, 0x80000007",
-                "cpuid",
-                "pop rbx",
-                out("edx") result,
-                out("eax") _,
-                out("ecx") _,
-                options(nomem)
-            );
-            (result >> 8) & 1 == 1
-        };
-        if !has_invariant_tsc {
-            eprintln!("[M13-TSC] WARNING: CPU lacks invariant TSC. Using clock_gettime fallback.");
-            return TscCal::fallback();
-        }
-    }
-
-    // Warm up caches: 100 iterations (discard results)
-    for _ in 0..100 {
-        let _ = read_tsc();
-        let _ = clock_ns();
-    }
-
-    // Two-point calibration over 100ms
-    let tsc0 = read_tsc();
-    let mono0 = clock_ns();
-    std::thread::sleep(Duration::from_millis(100));
-    let tsc1 = read_tsc();
-    let mono1 = clock_ns();
-
-    let tsc_delta = tsc1.wrapping_sub(tsc0);
-    let mono_delta = mono1.saturating_sub(mono0);
-
-    if tsc_delta == 0 || mono_delta == 0 {
-        eprintln!("[M13-TSC] WARNING: TSC calibration failed (zero delta). Using fallback.");
-        return TscCal::fallback();
-    }
-
-    // Compute ns_per_tick as fixed-point: mult / 2^shift
-    // Choose shift = 32 for maximum precision with u32 mult.
-    // mult = (mono_delta * 2^32) / tsc_delta
-    let shift: u32 = 32;
-    let mult = ((mono_delta as u128) << shift) / (tsc_delta as u128);
-    if mult > u32::MAX as u128 {
-        eprintln!("[M13-TSC] WARNING: TSC frequency too low for u32 mult. Using fallback.");
-        return TscCal::fallback();
-    }
-    let mult = mult as u32;
-
-    // Snapshot the base point for conversion
-    let tsc_base = read_tsc();
-    let mono_base = clock_ns();
-
-    let cal = TscCal { tsc_base, mono_base, mult, shift, valid: true };
-
-    // Validation: compare rdtsc_ns() vs clock_ns() over 1000 samples.
-    // If any sample deviates by > 1µs, the calibration is bad.
-    let mut max_error: i64 = 0;
-    for _ in 0..1000 {
-        let tsc_time = rdtsc_ns(&cal) as i64;
-        let mono_time = clock_ns() as i64;
-        let err = (tsc_time - mono_time).abs();
-        if err > max_error { max_error = err; }
-    }
-
-    let tsc_freq_mhz = (tsc_delta as u128 * 1000) / (mono_delta as u128);
-    eprintln!("[M13-TSC] Calibrated: freq={}.{}MHz mult={} shift={} max_err={}ns",
-        tsc_freq_mhz / 1000, tsc_freq_mhz % 1000, mult, shift, max_error);
-
-    if max_error > 1000 { // > 1µs
-        eprintln!("[M13-TSC] WARNING: Calibration error {}ns > 1µs. Using clock_gettime fallback.", max_error);
-        return TscCal::fallback();
-    }
-
-    cal
-}
-
-#[inline(always)]
-unsafe fn prefetch_read_l1(addr: *const u8) {
-    #[cfg(target_arch = "x86_64")]
-    { core::arch::x86_64::_mm_prefetch(addr as *const i8, core::arch::x86_64::_MM_HINT_T0); }
-    #[cfg(target_arch = "aarch64")]
-    { core::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) addr, options(nostack, preserves_flags)); }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    { let _ = addr; }
-}
-
-// ============================================================================
-// SPRINT 5.7: ISOCHRONOUS SCHEDULER (5.9: cwnd + pacing-aware)
-// ============================================================================
-#[derive(Copy, Clone)]
-struct TxDesc { addr: u64, len: u32 }
-
-struct Scheduler {
-    critical: [TxDesc; 256],
-    critical_len: usize,
-    bulk: [TxDesc; 288],
-    bulk_len: usize,
-}
-
-impl Scheduler {
-    fn new() -> Self {
-        Scheduler {
-            critical: [TxDesc { addr: 0, len: 0 }; 256], critical_len: 0,
-            bulk: [TxDesc { addr: 0, len: 0 }; 288], bulk_len: 0,
-        }
-    }
-    /// Budget respects BBR cwnd (replaces hardcoded HW_FILL_MAX when BBR active).
-    #[inline(always)]
-    fn budget(&self, tx_avail: usize, cwnd: usize) -> usize {
-        let inflight = TX_RING_SIZE.saturating_sub(tx_avail);
-        let cap = cwnd.min(HW_FILL_MAX);
-        cap.saturating_sub(inflight).min(tx_avail)
-    }
-    #[inline(always)]
-    fn enqueue_critical(&mut self, addr: u64, len: u32) {
-        if self.critical_len < self.critical.len() {
-            self.critical[self.critical_len] = TxDesc { addr, len };
-            self.critical_len += 1;
-        }
-    }
-    #[inline(always)]
-    fn enqueue_bulk(&mut self, addr: u64, len: u32) {
-        if self.bulk_len < self.bulk.len() {
-            self.bulk[self.bulk_len] = TxDesc { addr, len };
-            self.bulk_len += 1;
-        }
-    }
-    /// Schedule: critical bypasses pacing (strict priority), bulk capped by bulk_limit.
-    fn schedule(&mut self, tx_path: &mut impl TxPath, stats: &Telemetry,
-                bulk_limit: usize) -> usize {
-        let avail = tx_path.available_slots() as usize;
-        let hw_budget = {
-            let inflight = TX_RING_SIZE.saturating_sub(avail);
-            HW_FILL_MAX.saturating_sub(inflight).min(avail)
-        };
-        let mut submitted = 0usize;
-        // Phase 1: Critical (feedback frames) — bypass pacing, HW-limited only
-        let crit = self.critical_len.min(hw_budget);
-        for i in 0..crit {
-            tx_path.stage_tx_addr(self.critical[i].addr, self.critical[i].len);
-            submitted += 1;
-        }
-        // Phase 2: Bulk (data frames) — pacing-limited AND HW-limited (FIFO order)
-        let bulk_hw = hw_budget.saturating_sub(submitted);
-        let bulk = self.bulk_len.min(bulk_hw).min(bulk_limit);
-        for i in 0..bulk {
-            tx_path.stage_tx_addr(self.bulk[i].addr, self.bulk[i].len);
-            submitted += 1;
-        }
-        if submitted > 0 {
-            tx_path.commit_tx();
-            tx_path.kick_tx();
-            stats.tx_count.value.fetch_add(submitted as u64, Ordering::Relaxed);
-        }
-        self.critical_len = 0;
-        self.bulk_len = 0;
-        submitted
-    }
-}
-
-
-
-// ============================================================================
-// SPRINT 5.10: DETERMINISTIC JITTER BUFFER
-// RFC 3550 EWMA jitter estimator + fixed-size circular buffer.
-// TC_CRITICAL frames: stochastic arrival → deterministic playout.
-// D_buf adaptive: k * J(ewma) + ε_proc, clamped [1ms, 100ms].
-// ============================================================================
-const JBUF_CAPACITY: usize = 64;       // 64 entries @ 100Hz = 640ms capacity
-const JBUF_K: u64 = 4;                 // Safety factor: P(|X-μ|>4σ) < 0.0063%
-const JBUF_MIN_DEPTH_NS: u64 = 1_000_000;     // Floor: 1ms
-const JBUF_MAX_DEPTH_NS: u64 = 100_000_000;   // Ceiling: 100ms
-const JBUF_DEFAULT_DEPTH_NS: u64 = 50_000_000; // Conservative initial: 50ms
-const JBUF_EWMA_GAIN_SHIFT: u32 = 4;  // 1/16 = right shift by 4 (RFC 3550)
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct JitterEntry {
-    addr: u64,       // UMEM frame address (slab slot stays allocated)
-    len: u32,        // frame length in bytes
-    release_ns: u64, // CLOCK_MONOTONIC time to release
-}
-
-/// RFC 3550 §6.4.1 interarrival jitter estimator.
-/// J(i) = J(i-1) + (|D(i)| - J(i-1)) >> 4
-/// D(i) = (R_i - R_{i-1}) - (S_i - S_{i-1})  [one-way delay variation]
-struct JitterEstimator {
-    last_rx_ns: u64,       // arrival time of previous TC_CRITICAL frame
-    last_seq: u64,         // sequence number of previous frame
-    jitter_ns: u64,        // current EWMA jitter estimate (ns)
-    seq_interval_ns: u64,  // expected inter-packet interval (ns), 0 = unknown
-}
-
-impl JitterEstimator {
-    fn new() -> Self {
-        JitterEstimator { last_rx_ns: 0, last_seq: 0, jitter_ns: 0, seq_interval_ns: 0 }
-    }
-    /// Update jitter estimate with a new TC_CRITICAL frame arrival.
-    /// rx_ns: CLOCK_MONOTONIC arrival time. seq: M13Header.seq_id.
-    #[inline(always)]
-    fn update(&mut self, rx_ns: u64, seq: u64) {
-        if self.last_rx_ns == 0 {
-            // First frame: seed the estimator, no jitter sample yet
-            self.last_rx_ns = rx_ns;
-            self.last_seq = seq;
-            return;
-        }
-        // Receiver inter-arrival: R_i - R_{i-1}
-        let rx_delta = rx_ns.saturating_sub(self.last_rx_ns);
-        // Sender inter-departure: (S_i - S_{i-1}) approximated from seq deltas
-        // If seq_interval_ns > 0, use it. Otherwise use rx_delta as baseline (no send clock).
-        let seq_delta = seq.saturating_sub(self.last_seq);
-        let send_delta = if self.seq_interval_ns > 0 && seq_delta > 0 {
-            seq_delta * self.seq_interval_ns
-        } else {
-            rx_delta // No send clock → D=0, jitter stays unchanged
-        };
-        // D(i) = one-way delay variation
-        let d = if rx_delta > send_delta {
-            rx_delta - send_delta
-        } else {
-            send_delta - rx_delta
-        };
-        // RFC 3550 EWMA: J(i) = J(i-1) + (|D(i)| - J(i-1)) / 16
-        if d > self.jitter_ns {
-            self.jitter_ns += (d - self.jitter_ns) >> JBUF_EWMA_GAIN_SHIFT;
-        } else {
-            self.jitter_ns -= (self.jitter_ns - d) >> JBUF_EWMA_GAIN_SHIFT;
-        }
-        self.last_rx_ns = rx_ns;
-        self.last_seq = seq;
-    }
-    #[inline(always)]
-    fn get(&self) -> u64 { self.jitter_ns }
-}
-
-/// Fixed-size circular jitter buffer. Zero heap allocation.
-/// Holds TC_CRITICAL frames until their deterministic release time.
-#[repr(align(128))]
-struct JitterBuffer {
-    entries: [JitterEntry; JBUF_CAPACITY],
-    head: usize,        // next slot to READ (oldest)
-    tail: usize,        // next slot to WRITE (newest)
-    depth_ns: u64,      // current D_buf in nanoseconds
-    epsilon_ns: u64,    // worst-case processing time (measured at boot)
-    estimator: JitterEstimator,
-    total_releases: u64,
-    total_drops: u64,
-}
-
-impl JitterBuffer {
-    fn new(epsilon_ns: u64) -> Self {
-        JitterBuffer {
-            entries: [JitterEntry { addr: 0, len: 0, release_ns: 0 }; JBUF_CAPACITY],
-            head: 0, tail: 0,
-            depth_ns: JBUF_DEFAULT_DEPTH_NS,
-            epsilon_ns,
-            estimator: JitterEstimator::new(),
-            total_releases: 0, total_drops: 0,
-        }
-    }
-
-    /// Update jitter estimate and recalculate D_buf
-    #[inline(always)]
-    fn update_jitter(&mut self, rx_ns: u64, seq: u64) {
-        self.estimator.update(rx_ns, seq);
-        let j = self.estimator.get();
-        if j > 0 {
-            let raw = JBUF_K * j + self.epsilon_ns;
-            self.depth_ns = raw.max(JBUF_MIN_DEPTH_NS).min(JBUF_MAX_DEPTH_NS);
-        }
-    }
-
-    /// Insert a TC_CRITICAL frame. Slab slot stays allocated (NOT freed).
-    /// Returns Some(dropped_addr) if overflow forced drop of oldest frame.
-    /// Caller MUST free the returned slab slot to prevent UMEM leak.
-    #[inline(always)]
-    fn insert(&mut self, addr: u64, len: u32, rx_ns: u64) -> Option<u64> {
-        let release_ns = rx_ns + self.depth_ns;
-        let mut dropped_addr = None;
-        // Overflow: if buffer is full, drop oldest (buffer undersized for this link)
-        if self.tail - self.head >= JBUF_CAPACITY {
-            let old_slot = self.head & (JBUF_CAPACITY - 1);
-            dropped_addr = Some(self.entries[old_slot].addr);
-            self.head += 1;
-            self.total_drops += 1;
-        }
-        let slot = self.tail & (JBUF_CAPACITY - 1);
-        self.entries[slot] = JitterEntry { addr, len, release_ns };
-        self.tail += 1;
-        dropped_addr
-    }
-
-    /// Drain due frames to scheduler as TC_CRITICAL. Returns (released, late_dropped).
-    #[inline(always)]
-    fn drain(&mut self, now_ns: u64, scheduler: &mut Scheduler) -> (usize, usize) {
-        let mut released = 0usize;
-        while self.head < self.tail {
-            let slot = self.head & (JBUF_CAPACITY - 1);
-            let e = &self.entries[slot];
-            if now_ns >= e.release_ns {
-                scheduler.enqueue_critical(e.addr, e.len);
-                self.head += 1;
-                released += 1;
-                self.total_releases += 1;
-            } else {
-                // Not yet time. Entries are time-ordered (monotonic insertion).
-                break;
-            }
-        }
-        (released, 0)
-    }
-}
-
-/// Measure worst-case hot-loop iteration time. Run 10K rdtsc_ns() pairs.
-/// Uses rdtsc (the actual hot-path clock) so epsilon reflects real overhead.
-fn measure_epsilon_proc(cal: &TscCal) -> u64 {
-    let mut max_delta = 0u64;
-    for _ in 0..10_000 {
-        let t0 = rdtsc_ns(cal);
-        // Simulate minimal work: one clock read (what a minimal loop iteration does)
-        let t1 = rdtsc_ns(cal);
-        let delta = t1.saturating_sub(t0);
-        if delta > max_delta { max_delta = delta; }
-    }
-    // Add 2x safety margin for real classify+schedule overhead
-    max_delta * 2
-}
-
-// RECEIVER STATE — tracks delivered packets for feedback generation
-// ============================================================================
-// ============================================================================
-// SPRINT 5.18: RX BITMAP — 1024-BIT SLIDING WINDOW LOSS DETECTOR
-// Tracks which seq_ids have been received. Zeros = gaps = losses.
-// O(1) mark via bitmask. O(words) advance via popcount.
-// Stack-allocated: 128 bytes = 2 cache lines.
-// ============================================================================
-
-/// 1024-bit sliding window bitmap for sequence gap detection.
-/// bit N = 1 means seq_id (base_seq + N) has been received.
-/// When the window advances, evicted zero-bits are counted as losses.
-struct RxBitmap {
-    bits: [u64; 16],       // 1024 bits = 16 x u64
-    base_seq: u64,         // seq_id corresponding to bit 0
-    loss_accum: u32,       // losses accumulated since last feedback
-    highest_marked: u64,   // highest seq_id marked in the bitmap
-}
-
-impl RxBitmap {
-    fn new() -> Self {
-        RxBitmap { bits: [0u64; 16], base_seq: 0, loss_accum: 0, highest_marked: 0 }
-    }
-
-    /// Mark a seq_id as received. Advances the window if seq exceeds capacity.
-    /// O(1) for in-window marks. O(words_shifted) for window advance.
-    #[inline(always)]
-    fn mark(&mut self, seq: u64) {
-        // Ignore packets before our window (too old — already evicted)
-        if seq < self.base_seq { return; }
-
-        let offset = seq - self.base_seq;
-
-        // If seq exceeds window, advance. Count gaps in evicted words.
-        if offset >= 1024 {
-            self.advance_to(seq);
-        }
-
-        let offset = (seq - self.base_seq) as usize;
-        if offset < 1024 {
-            let word = offset >> 6;   // offset / 64
-            let bit = offset & 63;    // offset % 64
-            self.bits[word] |= 1u64 << bit;
-        }
-
-        if seq > self.highest_marked {
-            self.highest_marked = seq;
-        }
-    }
-
-    /// Advance window so that `seq` fits within [base_seq, base_seq+1023].
-    /// Evicted words have their zero-bits counted as losses.
-    fn advance_to(&mut self, seq: u64) {
-        // How many words to shift out
-        let target_base = seq.saturating_sub(1023);
-        if target_base <= self.base_seq { return; }
-
-        let bit_shift = target_base - self.base_seq;
-        let word_shift = (bit_shift / 64) as usize;
-
-        if word_shift >= 16 {
-            // Entire window evicted — count all unmarked bits as losses
-            for w in 0..16 {
-                // Only count losses for sequence ranges we've actually entered
-                // (bits that were zero because we hadn't reached them yet aren't losses)
-                let word_base = self.base_seq + (w as u64 * 64);
-                if word_base < self.highest_marked {
-                    let relevant_bits = if word_base + 64 <= self.highest_marked {
-                        64
-                    } else {
-                        (self.highest_marked - word_base) as u32
-                    };
-                    let received = self.bits[w].count_ones().min(relevant_bits);
-                    self.loss_accum += relevant_bits - received;
-                }
-            }
-            self.bits = [0u64; 16];
-        } else {
-            // Partial shift: count gaps in evicted words, shift array
-            for w in 0..word_shift {
-                if w < 16 {
-                    let word_base = self.base_seq + (w as u64 * 64);
-                    if word_base < self.highest_marked {
-                        let relevant_bits = if word_base + 64 <= self.highest_marked {
-                            64
-                        } else {
-                            (self.highest_marked - word_base) as u32
-                        };
-                        let received = self.bits[w].count_ones().min(relevant_bits);
-                        self.loss_accum += relevant_bits - received;
-                    }
-                }
-            }
-            // Shift remaining words left
-            let remain = 16 - word_shift;
-            for i in 0..remain {
-                self.bits[i] = self.bits[i + word_shift];
-            }
-            for i in remain..16 {
-                self.bits[i] = 0;
-            }
-        }
-        self.base_seq = target_base;
-    }
-
-    /// Return (loss_count, nack_bitmap) and reset accumulator.
-    /// nack_bitmap: 64 bits relative to highest_marked-63.
-    /// Bit i = 1 means received, bit i = 0 means lost.
-    fn drain_losses(&mut self) -> (u32, u64) {
-        let losses = self.loss_accum;
-        self.loss_accum = 0;
-
-        // Build NACK bitmap: the 64 bits around highest_marked
-        let nack = if self.highest_marked >= self.base_seq + 63 {
-            let nack_base = self.highest_marked - 63;
-            if nack_base >= self.base_seq {
-                let offset = (nack_base - self.base_seq) as usize;
-                // Extract 64 contiguous bits starting at 'offset'
-                let word_idx = offset >> 6;
-                let bit_idx = offset & 63;
-                if bit_idx == 0 && word_idx < 16 {
-                    self.bits[word_idx]
-                } else if word_idx + 1 < 16 {
-                    // Cross-word extraction
-                    let lo = self.bits[word_idx] >> bit_idx;
-                    let hi = self.bits[word_idx + 1] << (64 - bit_idx);
-                    lo | hi
-                } else if word_idx < 16 {
-                    self.bits[word_idx] >> bit_idx
-                } else {
-                    u64::MAX // all received (out of range)
-                }
-            } else {
-                u64::MAX // all within range received
-            }
-        } else {
-            u64::MAX // not enough data yet
-        };
-
-        (losses, nack)
-    }
-}
-
-struct ReceiverState {
-    highest_seq: u64, delivered: u32,
-    last_feedback_ns: u64, last_rx_batch_ns: u64,
-}
-impl ReceiverState {
-    fn new() -> Self { ReceiverState { highest_seq: 0, delivered: 0, last_feedback_ns: 0, last_rx_batch_ns: 0 } }
-    #[inline(always)]
-    fn needs_feedback(&self, now_ns: u64, rtt_estimate_ns: u64) -> bool {
-        if self.delivered >= FEEDBACK_INTERVAL_PKTS { return true; }
-        if self.delivered > 0 && self.last_feedback_ns > 0
-            && now_ns.saturating_sub(self.last_feedback_ns) >= rtt_estimate_ns { return true; }
-        false
-    }
-}
-
-// ============================================================================
-// SPRINT 6.1: FRAGMENTATION ENGINE (cold path — handshake only)
-// ============================================================================
-
-/// Fragment sub-header. 8 bytes, prepended to payload when FLAG_FRAGMENT set.
-#[repr(C, packed)]
-#[derive(Copy, Clone)]
-struct FragHeader {
-    frag_msg_id: u16,   // Message ID (links fragments of same message)
-    frag_index: u8,     // Fragment index (0-based)
-    frag_total: u8,     // Total fragments in message
-    frag_offset: u16,   // Byte offset into original message
-    frag_len: u16,      // Bytes in this fragment
-}
-const FRAG_HDR_SIZE: usize = 8;
-const _FRAG_SZ: () = assert!(std::mem::size_of::<FragHeader>() == FRAG_HDR_SIZE);
-
-struct AssemblyBuffer {
-    fragments: [Option<Vec<u8>>; 16], received_mask: u16,
-    total: u8, first_rx_ns: u64,
-}
-impl AssemblyBuffer {
-    fn new(total: u8, now_ns: u64) -> Self {
-        AssemblyBuffer { fragments: Default::default(), received_mask: 0, total, first_rx_ns: now_ns }
-    }
-    fn insert(&mut self, index: u8, _offset: u16, data: &[u8]) -> bool {
-        if index >= 16 || index >= self.total { return false; }
-        let bit = 1u16 << index;
-        if self.received_mask & bit != 0 { return self.is_complete(); }
-        self.fragments[index as usize] = Some(data.to_vec());
-        self.received_mask |= bit;
-        self.is_complete()
-    }
-    fn is_complete(&self) -> bool {
-        let expected = (1u16 << self.total) - 1;
-        self.received_mask & expected == expected
-    }
-    fn reassemble(&self) -> Vec<u8> {
-        let mut result = Vec::new();
-        for i in 0..self.total as usize {
-            if let Some(ref data) = self.fragments[i] { result.extend_from_slice(data); }
-        }
-        result
-    }
-}
-
-struct Assembler { pending: HashMap<u16, AssemblyBuffer>, }
-impl Assembler {
-    fn new() -> Self { Assembler { pending: HashMap::new() } }
-    fn feed(&mut self, msg_id: u16, index: u8, total: u8, offset: u16,
-            data: &[u8], now_ns: u64) -> Option<Vec<u8>> {
-        let buf = self.pending.entry(msg_id).or_insert_with(|| AssemblyBuffer::new(total, now_ns));
-        if buf.insert(index, offset, data) {
-            let result = buf.reassemble();
-            self.pending.remove(&msg_id);
-            Some(result)
-        } else { None }
-    }
-    fn gc(&mut self, now_ns: u64) {
-        self.pending.retain(|_, buf| now_ns.saturating_sub(buf.first_rx_ns) < 5_000_000_000);
-    }
-}
-
-// ============================================================================
-// SPRINT 3: AES-256-GCM AEAD via `ring` (BoringSSL asm)
-// x86: AES-NI hw accel (~4-10 GiB/s). ARM A53 (K26): ARMv8 Crypto Extensions.
-// Future: FPGA AES-GCM IP core for line-rate offload. Wire format unchanged.
-// ============================================================================
-
-use ring::aead;
-
-fn seal_frame(frame: &mut [u8], lsk: &aead::LessSafeKey, seq: u64, direction: u8, offset: usize) {
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes[0..8].copy_from_slice(&seq.to_le_bytes());
-    nonce_bytes[8] = direction;
-    let sig = offset;
-    frame[sig+2] = 0x01; frame[sig+3] = 0x00;
-    frame[sig+20..sig+32].copy_from_slice(&nonce_bytes);
-    let pt = sig + 32;
-    let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
-    let aad_bytes: [u8; 4] = frame[sig..sig+4].try_into().unwrap();
-    let aad = aead::Aad::from(aad_bytes);
-    let tag = lsk.seal_in_place_separate_tag(nonce, aad, &mut frame[pt..]).unwrap();
-    frame[sig+4..sig+20].copy_from_slice(tag.as_ref());
-}
-
-fn open_frame(frame: &mut [u8], lsk: &aead::LessSafeKey, our_dir: u8, offset: usize) -> bool {
-    let sig = offset;
-    if frame.len() < sig + 32 + 8 { return false; }
-    if frame[sig+2] != 0x01 { return false; }
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(&frame[sig+20..sig+32]);
-    if nonce_bytes[8] == our_dir { return false; } // reflection guard
-    let mut wire_tag_bytes = [0u8; 16];
-    wire_tag_bytes.copy_from_slice(&frame[sig+4..sig+20]);
-    let pt = sig + 32;
-    let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
-    let aad_bytes: [u8; 4] = frame[sig..sig+4].try_into().unwrap();
-    let aad = aead::Aad::from(&aad_bytes);
-    let tag = aead::Tag::from(wire_tag_bytes);
-    match lsk.open_in_place_separate_tag(nonce, aad, tag, &mut frame[pt..], 0..) {
-        Ok(_) => {
-            let dec_seq = u64::from_le_bytes(frame[pt..pt+8].try_into().unwrap());
-            let nonce_seq = u64::from_le_bytes(nonce_bytes[0..8].try_into().unwrap());
-            dec_seq == nonce_seq
-        }
-        Err(_) => false,
-    }
-}
-
-
-
-// ============================================================================
-// SPRINT 6.3: PQC HANDSHAKE — HUB RESPONDER
-// ============================================================================
-// Hub receives:
-//   Msg 1 (ClientHello): nonce(32) + ek(1568) + pk_node(2592) = 4192 bytes
-//   Msg 3 (Finished):    sig_node(4627) bytes
-// Hub sends:
-//   Msg 2 (ServerHello): ct(1568) + pk_hub(2592) + sig_hub(4627) = 8787 bytes
-//
-// Session key = HKDF-SHA-512(salt=nonce, IKM=ML-KEM-ss, info="M13-PQC-SESSION-KEY-v1", L=32)
-// ============================================================================
-
-const PQC_CONTEXT: &[u8] = b"M13-HS-v1";
-const PQC_INFO: &[u8] = b"M13-PQC-SESSION-KEY-v1";
-
-/// Hub-side handshake state: stored between ClientHello and Finished processing.
-struct HubHandshakeState {
-    /// Node's ML-DSA-87 verifying key bytes (for Finished verification)
-    node_pk_bytes: Vec<u8>,
-    /// ML-KEM shared secret (32 bytes, derived from encapsulation)
-    shared_secret: [u8; 32],
-    /// Session nonce from ClientHello (32 bytes, HKDF salt)
-    session_nonce: [u8; 32],
-    /// Full ClientHello payload bytes (for transcript computation)
-    client_hello_bytes: Vec<u8>,
-    /// Full ServerHello payload bytes (for transcript computation)
-    server_hello_bytes: Vec<u8>,
-    /// Handshake start timestamp (for timeout)
-    _started_ns: u64,
-}
 
 /// Build fragmented handshake frames as raw ETH+IP+UDP packets for AF_XDP TX.
 /// Returns Vec of ready-to-transmit raw frames (no kernel socket involvement).
@@ -876,175 +143,6 @@ fn build_fragmented_raw_udp(
     frames
 }
 
-/// Process a ClientHello (Msg 1) from a Node.
-/// Encapsulates shared secret, signs transcript, builds ServerHello payload.
-/// Returns (HubHandshakeState, server_hello_payload) for caller to frame.
-///
-/// ClientHello layout: type(1) + version(1) + nonce(32) + ek(1568) + pk_node(2592) = 4194 bytes
-/// ServerHello layout: type(1) + ct(1568) + pk_hub(2592) + sig_hub(4627) = 8788 bytes
-fn process_client_hello_hub(
-    reassembled: &[u8],
-    _seq: &mut u64,
-    now: u64,
-) -> Option<(HubHandshakeState, Vec<u8>)> {
-    // Validate: type(1) + version(1) + nonce(32) + ek(1568) + pk_node(2592) = 4194
-    const EXPECTED_LEN: usize = 1 + 1 + 32 + 1568 + 2592;
-    if reassembled.len() < EXPECTED_LEN {
-        eprintln!("[M13-HUB-PQC] ERROR: ClientHello too short: {} < {}", reassembled.len(), EXPECTED_LEN);
-        return None;
-    }
-    if reassembled[0] != HS_CLIENT_HELLO {
-        eprintln!("[M13-HUB-PQC] ERROR: Expected ClientHello (0x01), got 0x{:02X}", reassembled[0]);
-        return None;
-    }
-    if reassembled[1] != 0x01 {
-        eprintln!("[M13-HUB-PQC] ERROR: Unsupported protocol version: 0x{:02X}", reassembled[1]);
-        return None;
-    }
-
-    eprintln!("[M13-HUB-PQC] Processing ClientHello ({}B, proto_v={})...", reassembled.len(), reassembled[1]);
-
-    // Parse fields (version byte shifts all offsets by +1)
-    let mut session_nonce = [0u8; 32];
-    session_nonce.copy_from_slice(&reassembled[2..34]);
-    let ek_bytes = &reassembled[34..1602];        // ML-KEM-1024 encapsulation key (1568B)
-    let pk_node_bytes = &reassembled[1602..4194];  // ML-DSA-87 verifying key (2592B)
-
-    // 1. Reconstruct EncapsulationKey from bytes
-    let ek_enc = match ml_kem::Encoded::<ml_kem::kem::EncapsulationKey<ml_kem::MlKem1024Params>>::try_from(
-        ek_bytes
-    ) {
-        Ok(enc) => enc,
-        Err(_) => {
-            eprintln!("[M13-HUB-PQC] ERROR: Failed to parse EncapsulationKey");
-            return None;
-        }
-    };
-    let ek = ml_kem::kem::EncapsulationKey::<ml_kem::MlKem1024Params>::from_bytes(&ek_enc);
-
-    // 2. Encapsulate: ek + OsRng → (ct, ss)
-    let (ct, ss) = match ek.encapsulate(&mut OsRng) {
-        Ok((ct, ss)) => (ct, ss),
-        Err(_) => {
-            eprintln!("[M13-HUB-PQC] ERROR: ML-KEM encapsulation failed");
-            return None;
-        }
-    };
-    let ct_bytes_arr = ct;
-    eprintln!("[M13-HUB-PQC] ML-KEM-1024 encapsulation successful (ct={}B, ss=32B)", ct_bytes_arr.len());
-
-    // 3. Generate Hub's ML-DSA-87 identity keypair (TOFU)
-    let dsa_kp = MlDsa87::key_gen(&mut OsRng);
-    let pk_hub = dsa_kp.verifying_key().encode(); // 2592 bytes
-    eprintln!("[M13-HUB-PQC] ML-DSA-87 identity generated (pk={}B)", pk_hub.len());
-
-    // 4. Compute transcript = SHA-512(ClientHello_payload || ct)
-    let mut hasher = Sha512::new();
-    hasher.update(reassembled);
-    hasher.update(ct_bytes_arr.as_slice());
-    let transcript: [u8; 64] = hasher.finalize().into();
-
-    // 5. Sign transcript with Hub's signing key
-    let sig_hub = match dsa_kp.signing_key().sign_deterministic(&transcript, PQC_CONTEXT) {
-        Ok(sig) => sig,
-        Err(_) => {
-            eprintln!("[M13-HUB-PQC] ERROR: ML-DSA signing failed");
-            return None;
-        }
-    };
-    let sig_hub_bytes = sig_hub.encode(); // 4627 bytes
-    eprintln!("[M13-HUB-PQC] Hub signature generated ({}B)", sig_hub_bytes.len());
-
-    // 6. Build ServerHello payload: type(1) + ct(1568) + pk_hub(2592) + sig_hub(4627) = 8788
-    let mut server_hello = Vec::with_capacity(1 + ct_bytes_arr.len() + pk_hub.len() + sig_hub_bytes.len());
-    server_hello.push(HS_SERVER_HELLO);
-    server_hello.extend_from_slice(ct_bytes_arr.as_slice());
-    server_hello.extend_from_slice(&pk_hub);
-    server_hello.extend_from_slice(&sig_hub_bytes);
-
-    eprintln!("[M13-HUB-PQC] ServerHello built: {}B payload", server_hello.len());
-
-    // 7. Store intermediate state for Finished processing
-    let mut ss_arr = [0u8; 32];
-    ss_arr.copy_from_slice(&ss);
-    Some((HubHandshakeState {
-        node_pk_bytes: pk_node_bytes.to_vec(),
-        shared_secret: ss_arr,
-        session_nonce,
-        client_hello_bytes: reassembled.to_vec(),
-        server_hello_bytes: server_hello.clone(),
-        _started_ns: now,
-    }, server_hello))
-}
-
-/// Process a Finished message (Msg 3) from a Node.
-/// Verifies Node's ML-DSA-87 signature, derives session key via HKDF-SHA-512.
-/// Returns session_key on success.
-///
-/// Finished layout: type(1) + sig_node(4627) = 4628 bytes
-fn process_finished_hub(
-    reassembled: &[u8],
-    hs_state: &HubHandshakeState,
-) -> Option<[u8; 32]> {
-    // Validate length: type(1) + sig(4627) = 4628
-    const EXPECTED_LEN: usize = 1 + 4627;
-    if reassembled.len() < EXPECTED_LEN {
-        eprintln!("[M13-HUB-PQC] ERROR: Finished too short: {} < {}", reassembled.len(), EXPECTED_LEN);
-        return None;
-    }
-    if reassembled[0] != HS_FINISHED {
-        eprintln!("[M13-HUB-PQC] ERROR: Expected Finished (0x03), got 0x{:02X}", reassembled[0]);
-        return None;
-    }
-
-    eprintln!("[M13-HUB-PQC] Processing Finished ({}B)...", reassembled.len());
-
-    let sig_node_bytes = &reassembled[1..4628];
-
-    // 1. Compute transcript2 = SHA-512(ClientHello_payload || ServerHello_payload)
-    let mut hasher = Sha512::new();
-    hasher.update(&hs_state.client_hello_bytes);
-    hasher.update(&hs_state.server_hello_bytes);
-    let transcript2: [u8; 64] = hasher.finalize().into();
-
-    // 2. Parse Node's verifying key
-    let pk_node_enc = match ml_dsa::EncodedVerifyingKey::<MlDsa87>::try_from(
-        hs_state.node_pk_bytes.as_slice()
-    ) {
-        Ok(enc) => enc,
-        Err(_) => {
-            eprintln!("[M13-HUB-PQC] ERROR: Failed to parse Node verifying key");
-            return None;
-        }
-    };
-    let pk_node = ml_dsa::VerifyingKey::<MlDsa87>::decode(&pk_node_enc);
-
-    // 3. Parse Node's signature
-    let sig_node = match ml_dsa::Signature::<MlDsa87>::try_from(sig_node_bytes) {
-        Ok(sig) => sig,
-        Err(_) => {
-            eprintln!("[M13-HUB-PQC] ERROR: Failed to parse Node signature");
-            return None;
-        }
-    };
-
-    // 4. Verify signature
-    if !pk_node.verify_with_context(&transcript2, PQC_CONTEXT, &sig_node) {
-        eprintln!("[M13-HUB-PQC] SECURITY FAILURE: Node signature verification failed!");
-        eprintln!("[M13-HUB-PQC] Possible MITM attack — aborting handshake");
-        return None;
-    }
-    eprintln!("[M13-HUB-PQC] Node ML-DSA-87 signature verified ✓");
-
-    // 5. Derive session key via HKDF-SHA-512
-    let hk = Hkdf::<Sha512>::new(Some(&hs_state.session_nonce), &hs_state.shared_secret);
-    let mut session_key = [0u8; 32];
-    hk.expand(PQC_INFO, &mut session_key)
-        .expect("HKDF-SHA-512 expand failed (L=32 ≤ 255*64)");
-    eprintln!("[M13-HUB-PQC] Session key derived via HKDF-SHA-512 (32B)");
-
-    Some(session_key)
-}
 
 // ============================================================================
 // SPRINT 6.1: HEXDUMP ENGINE (all 4 capture points, rate-limited)
@@ -1110,190 +208,6 @@ extern "C" fn signal_handler(_sig: i32) {
 
 /// Read the hardware MAC address of a network interface from sysfs.
 /// Returns the 6-byte MAC or a locally-administered fallback if sysfs is unavailable.
-fn detect_mac(if_name: &str) -> [u8; 6] {
-    let path = format!("/sys/class/net/{}/address", if_name);
-    if let Ok(contents) = std::fs::read_to_string(&path) {
-        let parts: Vec<u8> = contents.trim().split(':')
-            .filter_map(|h| u8::from_str_radix(h, 16).ok())
-            .collect();
-        if parts.len() == 6 {
-            eprintln!("[M13-EXEC] Detected MAC for {}: {}", if_name, contents.trim());
-            return [parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]];
-        }
-    }
-    eprintln!("[M13-EXEC] WARNING: Could not read MAC from sysfs ({}), using LAA fallback", path);
-    [0x02, 0x00, 0x00, 0x00, 0x00, 0x01] // locally administered fallback
-}
-
-/// Resolve the default gateway's MAC address from the kernel ARP cache.
-/// Reads /proc/net/route to find the default gateway IP, then /proc/net/arp for its MAC.
-/// This is the L2 destination for all internet-bound packets sent via AF_XDP TX.
-fn resolve_gateway_mac(if_name: &str) -> Option<([u8; 6], [u8; 4])> {
-    // Step 1: Find default gateway IP from /proc/net/route
-    // Format: Iface Destination Gateway Flags RefCnt Use Metric Mask ...
-    // Default route has Destination == 00000000
-    let route_data = std::fs::read_to_string("/proc/net/route").ok()?;
-    let mut gw_ip_hex: Option<u32> = None;
-    for line in route_data.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() >= 3 && fields[0] == if_name && fields[1] == "00000000" {
-            // Gateway is in hex, little-endian u32
-            gw_ip_hex = u32::from_str_radix(fields[2], 16).ok();
-            break;
-        }
-    }
-    let gw_hex = gw_ip_hex?;
-    let gw_ip = gw_hex.to_le_bytes(); // /proc/net/route stores in network byte order as LE hex
-
-    // Step 2: Look up gateway MAC in /proc/net/arp
-    // Format: IP address HW type Flags HW address Mask Device
-    let arp_data = std::fs::read_to_string("/proc/net/arp").ok()?;
-    let gw_ip_str = format!("{}.{}.{}.{}", gw_ip[0], gw_ip[1], gw_ip[2], gw_ip[3]);
-    for line in arp_data.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() >= 6 && fields[0] == gw_ip_str && fields[5] == if_name {
-            let mac_parts: Vec<u8> = fields[3].split(':')
-                .filter_map(|h| u8::from_str_radix(h, 16).ok())
-                .collect();
-            if mac_parts.len() == 6 {
-                let mac = [mac_parts[0], mac_parts[1], mac_parts[2],
-                           mac_parts[3], mac_parts[4], mac_parts[5]];
-                eprintln!("[M13-NET] Gateway: {} MAC: {} dev: {}",
-                    gw_ip_str, fields[3], if_name);
-                return Some((mac, gw_ip));
-            }
-        }
-    }
-    eprintln!("[M13-NET] WARNING: Gateway {} not in ARP cache. Pinging to populate...", gw_ip_str);
-    // Attempt to populate ARP cache by pinging gateway
-    let _ = std::process::Command::new("ping")
-        .args(["-c", "1", "-W", "1", &gw_ip_str])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    // Retry ARP lookup
-    if let Ok(arp2) = std::fs::read_to_string("/proc/net/arp") {
-        for line in arp2.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() >= 6 && fields[0] == gw_ip_str && fields[5] == if_name {
-                let mac_parts: Vec<u8> = fields[3].split(':')
-                    .filter_map(|h| u8::from_str_radix(h, 16).ok())
-                    .collect();
-                if mac_parts.len() == 6 {
-                    let mac = [mac_parts[0], mac_parts[1], mac_parts[2],
-                               mac_parts[3], mac_parts[4], mac_parts[5]];
-                    eprintln!("[M13-NET] Gateway: {} MAC: {} (after ARP)", gw_ip_str, fields[3]);
-                    return Some((mac, gw_ip));
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Read the IPv4 address of a network interface from sysfs.
-/// Returns the 4-byte IP address or None if unavailable.
-fn get_interface_ip(if_name: &str) -> Option<[u8; 4]> {
-    // Use ioctl SIOCGIFADDR
-    unsafe {
-        let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        if sock < 0 { return None; }
-        let mut ifr: libc::ifreq = std::mem::zeroed();
-        let name_bytes = if_name.as_bytes();
-        let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
-        std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), ifr.ifr_name.as_mut_ptr() as *mut u8, copy_len);
-        if libc::ioctl(sock, libc::SIOCGIFADDR as libc::c_ulong, &mut ifr) < 0 {
-            libc::close(sock);
-            return None;
-        }
-        libc::close(sock);
-        // ifr_ifru.ifru_addr is a sockaddr_in
-        let sa = &*(&ifr.ifr_ifru as *const _ as *const libc::sockaddr_in);
-        let ip_u32 = sa.sin_addr.s_addr; // network byte order
-        let _ip = ip_u32.to_be_bytes();
-        // s_addr is in network byte order; to_ne_bytes gives the octets in correct order
-        let ip_ne = ip_u32.to_ne_bytes();
-        eprintln!("[M13-NET] Interface {} IP: {}.{}.{}.{}", if_name,
-            ip_ne[0], ip_ne[1], ip_ne[2], ip_ne[3]);
-        Some(ip_ne)
-    }
-}
-
-/// RFC 1071: Internet checksum (ones-complement of ones-complement sum).
-/// Used for IPv4 header checksum. Input is the 20-byte IP header with checksum field zeroed.
-#[inline]
-fn ip_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < data.len() {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < data.len() {
-        sum += (data[i] as u32) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-/// Construct a raw Ethernet + IPv4 + UDP frame in a buffer.
-/// Returns the total frame length (ETH_HDR + IP_HDR + UDP_HDR + payload).
-/// The frame is ready for AF_XDP TX — no kernel involvement.
-///
-/// Layout: ETH(14) + IP(20) + UDP(8) + payload = 42 + payload_len
-/// IP checksum is computed. UDP checksum is 0 (legal for IPv4 per RFC 768).
-const IP_HDR_LEN: usize = 20;
-const UDP_HDR_LEN: usize = 8;
-const RAW_HDR_LEN: usize = ETH_HDR_SIZE + IP_HDR_LEN + UDP_HDR_LEN; // 42
-
-fn build_raw_udp_frame(
-    buf: &mut [u8],
-    src_mac: &[u8; 6], dst_mac: &[u8; 6],
-    src_ip: [u8; 4], dst_ip: [u8; 4],
-    src_port: u16, dst_port: u16,
-    ip_id: u16,
-    payload: &[u8],
-) -> usize {
-    let payload_len = payload.len();
-    let udp_len = UDP_HDR_LEN + payload_len;
-    let ip_total_len = IP_HDR_LEN + udp_len;
-    let frame_len = ETH_HDR_SIZE + ip_total_len;
-    debug_assert!(frame_len <= buf.len(), "frame too large for buffer");
-
-    // --- Ethernet Header (14 bytes) ---
-    buf[0..6].copy_from_slice(dst_mac);
-    buf[6..12].copy_from_slice(src_mac);
-    buf[12..14].copy_from_slice(&0x0800u16.to_be_bytes()); // IPv4
-
-    // --- IPv4 Header (20 bytes) ---
-    let ip = &mut buf[14..34];
-    ip[0] = 0x45;                                           // Version=4, IHL=5 (20 bytes)
-    ip[1] = 0x00;                                           // DSCP/ECN
-    ip[2..4].copy_from_slice(&(ip_total_len as u16).to_be_bytes()); // Total Length
-    ip[4..6].copy_from_slice(&ip_id.to_be_bytes());         // Identification
-    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());     // Flags: DF, Fragment Offset: 0
-    ip[8] = 64;                                             // TTL
-    ip[9] = 17;                                             // Protocol: UDP
-    ip[10..12].copy_from_slice(&[0, 0]);                    // Checksum (zeroed for computation)
-    ip[12..16].copy_from_slice(&src_ip);                    // Source IP
-    ip[16..20].copy_from_slice(&dst_ip);                    // Destination IP
-    let cksum = ip_checksum(ip);
-    ip[10..12].copy_from_slice(&cksum.to_be_bytes());       // Fill in checksum
-
-    // --- UDP Header (8 bytes) ---
-    let udp = &mut buf[34..42];
-    udp[0..2].copy_from_slice(&src_port.to_be_bytes());     // Source Port
-    udp[2..4].copy_from_slice(&dst_port.to_be_bytes());     // Destination Port
-    udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes()); // UDP Length
-    udp[6..8].copy_from_slice(&[0, 0]);                     // Checksum: 0 (valid for IPv4)
-
-    // --- Payload ---
-    buf[42..42 + payload_len].copy_from_slice(payload);
-
-    frame_len
-}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1415,372 +329,6 @@ impl Peer<Established> {
 // ============================================================================
 
 /// Maximum concurrent peers. Must be power of 2 for mask-based indexing.
-const MAX_PEERS: usize = 256;
-
-/// Tunnel IP subnet: 10.13.0.0/24. Hub is .1, peers get .2..254.
-const TUNNEL_SUBNET: [u8; 4] = [10, 13, 0, 0];
-
-/// 6-byte peer identity: (src_ip, src_port) from the wire.
-/// This is the natural key for UDP peers behind NAT — each unique
-/// (public_ip, ephemeral_port) pair is a distinct peer.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PeerAddr {
-    /// Empty/uninitialized slot
-    Empty,
-    /// UDP peer identified by (src_ip, src_port) — satellite/internet path
-    Udp { ip: [u8; 4], port: u16 },
-    /// Raw L2 peer identified by src MAC — air-gapped WiFi 7 path
-    L2 { mac: [u8; 6] },
-}
-
-impl PeerAddr {
-    const EMPTY: PeerAddr = PeerAddr::Empty;
-
-    #[inline(always)]
-    fn new_udp(ip: [u8; 4], port: u16) -> Self { PeerAddr::Udp { ip, port } }
-
-    #[inline(always)]
-    fn new_l2(mac: [u8; 6]) -> Self { PeerAddr::L2 { mac } }
-
-    /// Returns IP if this is a UDP peer, None for L2.
-    #[inline(always)]
-    fn ip(&self) -> Option<[u8; 4]> {
-        match self { PeerAddr::Udp { ip, .. } => Some(*ip), _ => None }
-    }
-
-    /// Returns port if this is a UDP peer, None for L2.
-    #[inline(always)]
-    fn port(&self) -> Option<u16> {
-        match self { PeerAddr::Udp { port, .. } => Some(*port), _ => None }
-    }
-
-    #[inline(always)]
-    fn is_udp(&self) -> bool { matches!(self, PeerAddr::Udp { .. }) }
-
-    /// FNV-1a hash. 6 bytes for UDP (ip+port), 6 bytes for L2 (mac).
-    #[inline(always)]
-    fn hash(&self) -> usize {
-        let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
-        let bytes: [u8; 6] = match self {
-            PeerAddr::Udp { ip, port } => [
-                ip[0], ip[1], ip[2], ip[3],
-                (*port & 0xFF) as u8, (*port >> 8) as u8,
-            ],
-            PeerAddr::L2 { mac } => *mac,
-            PeerAddr::Empty => return 0,
-        };
-        let mut i = 0;
-        while i < 6 {
-            h ^= bytes[i] as u64;
-            h = h.wrapping_mul(0x100000001b3); // FNV prime
-            i += 1;
-        }
-        h as usize
-    }
-}
-
-impl std::fmt::Debug for PeerAddr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PeerAddr::Empty => write!(f, "<empty>"),
-            PeerAddr::Udp { ip, port } => write!(f, "{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port),
-            PeerAddr::L2 { mac } => write!(f, "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]),
-        }
-    }
-}
-
-/// Peer lifecycle state machine.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-enum PeerLifecycle {
-    /// Slot is empty and available for allocation.
-    Empty = 0,
-    /// Peer registered (first packet seen), awaiting handshake.
-    Registered = 1,
-    /// PQC handshake in progress (ClientHello received, ServerHello sent).
-    Handshaking = 2,
-    /// AEAD session established, encrypted tunnel active.
-    Established = 3,
-}
-
-/// Per-peer state. Exactly 1 cache line (64 bytes) for zero false sharing.
-/// Hot-path fields (session_key, seq_tx) are at fixed offsets.
-#[repr(C, align(64))]
-struct PeerSlot {
-    /// Lookup key: identity
-    addr: PeerAddr,                 // 8 bytes (enum: tag + 6 data + padding)
-    /// Lifecycle state.
-    lifecycle: PeerLifecycle,       // 1 byte
-    /// Index into tunnel IP pool (10.13.0.{tunnel_ip_idx}).
-    tunnel_ip_idx: u8,              // 1 byte
-
-    /// AEAD session key (32 bytes). Zero = no session.
-    session_key: [u8; 32],          // 32 bytes
-
-    /// TX sequence counter for AEAD nonces.
-    seq_tx: u64,                    // 8 bytes
-
-    /// AEAD frames processed under current session (for rekey).
-    frame_count: u32,               // 4 bytes
-    /// Session established timestamp (relative seconds since epoch).
-    established_rel_s: u32,         // 4 bytes
-
-    /// Peer's Ethernet MAC (from M13 frame src_mac). Used for TX framing.
-    mac: [u8; 6],                   // 6 bytes
-    // Note: align(64) rounds 64 actual data bytes to 64 — no explicit pad needed.
-}
-
-// Compile-time assertion: PeerSlot fits within 1 cache line (64-byte aligned).
-// The actual layout with #[repr(C, align(64))] handles alignment padding.
-
-impl PeerSlot {
-    const EMPTY: PeerSlot = PeerSlot {
-        addr: PeerAddr::EMPTY,
-        lifecycle: PeerLifecycle::Empty,
-        tunnel_ip_idx: 0,
-        session_key: [0u8; 32],
-        seq_tx: 0,
-        frame_count: 0,
-        established_rel_s: 0,
-        mac: [0xFF; 6],
-    };
-
-    #[inline(always)]
-    fn is_empty(&self) -> bool { self.lifecycle == PeerLifecycle::Empty }
-
-    #[inline(always)]
-    fn has_session(&self) -> bool { self.session_key != [0u8; 32] }
-
-    #[inline(always)]
-    fn next_seq(&mut self) -> u64 {
-        let s = self.seq_tx;
-        self.seq_tx = s.wrapping_add(1);
-        s
-    }
-
-    /// Reset session state for reconnect/rekey. Preserves slot identity.
-    fn reset_session(&mut self) {
-        self.session_key = [0u8; 32];
-        self.seq_tx = 0;
-        self.frame_count = 0;
-        self.established_rel_s = 0;
-        self.lifecycle = PeerLifecycle::Registered;
-    }
-}
-
-/// Multi-tenant peer table. Single-threaded (owned by one worker).
-/// Flat array with linear probing — zero allocation on lookup, O(1) amortized.
-struct PeerTable {
-    /// Cache-line-aligned flat array of peer slots.
-    slots: Box<[PeerSlot; MAX_PEERS]>,
-    /// Cold-path sidecar: per-peer handshake state (ML-KEM, DSA, transcript).
-    /// Indexed by slot index. Only touched during PQC handshake.
-    hs_sidecar: Vec<Option<HubHandshakeState>>,
-    /// Per-peer cached AEAD cipher. Indexed by slot index.
-    /// Constructed once on session establishment, reused for every frame.
-    ciphers: Vec<Option<aead::LessSafeKey>>,
-    /// Per-peer fragment reassembly. Indexed by slot index.
-    assemblers: Vec<Assembler>,
-    /// Number of active (non-Empty) peers.
-    count: u16,
-    /// Tunnel IP allocation bitmap. Bit N = IP 10.13.0.N is assigned.
-    /// Indices 0 and 1 are reserved (network + Hub).
-    tunnel_ip_bitmap: [u64; 4], // 256 bits
-    /// Base timestamp for relative time storage.
-    epoch_ns: u64,
-}
-
-impl PeerTable {
-    fn new(epoch_ns: u64) -> Self {
-        // Allocate the slots array on the heap (16KB, can't go on stack).
-        // Use a Vec -> try_into -> Box conversion to get a fixed-size boxed array.
-        let mut slots_vec: Vec<PeerSlot> = Vec::with_capacity(MAX_PEERS);
-        for _ in 0..MAX_PEERS {
-            slots_vec.push(PeerSlot::EMPTY);
-        }
-        let slots_array: Box<[PeerSlot; MAX_PEERS]> = match slots_vec.into_boxed_slice().try_into() {
-            Ok(arr) => arr,
-            Err(_) => unreachable!(),
-        };
-
-        let mut hs_sidecar = Vec::with_capacity(MAX_PEERS);
-        let mut ciphers: Vec<Option<aead::LessSafeKey>> = Vec::with_capacity(MAX_PEERS);
-        let mut assemblers = Vec::with_capacity(MAX_PEERS);
-        for _ in 0..MAX_PEERS {
-            hs_sidecar.push(None);
-            ciphers.push(None);
-            assemblers.push(Assembler::new());
-        }
-
-        // Reserve tunnel IPs 0 (network) and 1 (Hub).
-        let mut tunnel_ip_bitmap = [0u64; 4];
-        tunnel_ip_bitmap[0] = 0b11; // bits 0 and 1 reserved
-
-        PeerTable {
-            slots: slots_array,
-            hs_sidecar,
-            ciphers,
-            assemblers,
-            count: 0,
-            tunnel_ip_bitmap,
-            epoch_ns,
-        }
-    }
-
-    /// O(1) amortized lookup by peer address. Returns slot index.
-    #[inline(always)]
-    fn lookup(&self, addr: PeerAddr) -> Option<usize> {
-        let mut idx = addr.hash() & (MAX_PEERS - 1);
-        for _ in 0..MAX_PEERS {
-            if self.slots[idx].addr == addr && !self.slots[idx].is_empty() {
-                return Some(idx);
-            }
-            // NOTE: Do NOT early-return on empty slots. evict() creates tombstones
-            // without compacting the hash chain, so peers beyond a tombstone would
-            // be silently ghosted. Let the bounded loop scan the full chain.
-            idx = (idx + 1) & (MAX_PEERS - 1);
-        }
-        None
-    }
-
-    /// Lookup or insert a new peer. Returns slot index.
-    /// On insert: allocates tunnel IP, initializes slot as Registered.
-    fn lookup_or_insert(&mut self, addr: PeerAddr, mac: [u8; 6]) -> Option<usize> {
-        let start = addr.hash() & (MAX_PEERS - 1);
-        let mut idx = start;
-        let mut first_empty: Option<usize> = None;
-
-        for _ in 0..MAX_PEERS {
-            if self.slots[idx].addr == addr && !self.slots[idx].is_empty() {
-                // Update MAC in case peer changed interface
-                self.slots[idx].mac = mac;
-                return Some(idx);
-            }
-            if self.slots[idx].is_empty() && first_empty.is_none() {
-                first_empty = Some(idx);
-                // Don't break — there might be a matching slot after a tombstone.
-                // But we don't use tombstones (we compact on evict), so we CAN break.
-                break;
-            }
-            idx = (idx + 1) & (MAX_PEERS - 1);
-        }
-
-        // Not found — insert into first empty slot.
-        let slot_idx = first_empty?;
-        if self.count as usize >= MAX_PEERS - 1 { return None; } // Table full
-
-        // Same-IP stale peer eviction: if a Node reconnects with a different
-        // ephemeral port (e.g. after Ctrl+C where FIN was never delivered),
-        // the old slot stays Established. Detect and evict it.
-        // Key insight: MAC is unreliable (Node generates random LAA MAC each launch).
-        // Source IP is the stable identity — same public IP with different port = same Node.
-        // This is O(N) but only runs on new peer registration — cold path.
-        for i in 0..MAX_PEERS {
-            if i == slot_idx { continue; }
-            if !self.slots[i].is_empty() && self.slots[i].addr.ip() == addr.ip() && self.slots[i].addr != addr {
-                eprintln!("[M13-PEERS] Stale peer {:?} in slot {} has same IP as new peer {:?} — evicting.",
-                    self.slots[i].addr, i, addr);
-                self.evict(i);
-            }
-        }
-
-        // Allocate tunnel IP
-        let tunnel_idx = self.alloc_tunnel_ip()?;
-
-        self.slots[slot_idx] = PeerSlot {
-            addr,
-            lifecycle: PeerLifecycle::Registered,
-            tunnel_ip_idx: tunnel_idx,
-            session_key: [0u8; 32],
-            seq_tx: 0,
-            frame_count: 0,
-            established_rel_s: 0,
-            mac,
-        };
-        self.hs_sidecar[slot_idx] = None;
-        self.assemblers[slot_idx] = Assembler::new();
-        self.count += 1;
-
-        eprintln!("[M13-PEERS] New peer {:?} → slot {} tunnel_ip=10.13.0.{} (total: {})",
-            addr, slot_idx, tunnel_idx, self.count);
-
-        Some(slot_idx)
-    }
-
-    /// Evict a peer, freeing its slot and tunnel IP.
-    fn evict(&mut self, idx: usize) {
-        if idx >= MAX_PEERS || self.slots[idx].is_empty() { return; }
-        let tip = self.slots[idx].tunnel_ip_idx;
-        self.free_tunnel_ip(tip);
-        eprintln!("[M13-PEERS] Evicted peer {:?} from slot {} (tunnel_ip=10.13.0.{})",
-            self.slots[idx].addr, idx, tip);
-        self.slots[idx] = PeerSlot::EMPTY;
-        self.hs_sidecar[idx] = None;
-        self.ciphers[idx] = None;
-        self.assemblers[idx] = Assembler::new();
-        if self.count > 0 { self.count -= 1; }
-    }
-
-    /// Find peer slot by tunnel destination IP (for TUN TX routing).
-    /// Scans linearly — only called on TUN read (cold relative to RX classify).
-    fn lookup_by_tunnel_ip(&self, dst_ip: [u8; 4]) -> Option<usize> {
-        // Fast reject: not in our subnet
-        if dst_ip[0] != TUNNEL_SUBNET[0] || dst_ip[1] != TUNNEL_SUBNET[1]
-           || dst_ip[2] != TUNNEL_SUBNET[2] { return None; }
-        let target_idx = dst_ip[3];
-        for i in 0..MAX_PEERS {
-            if !self.slots[i].is_empty()
-               && self.slots[i].tunnel_ip_idx == target_idx
-               && self.slots[i].has_session() {
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    /// Allocate a tunnel IP index (2..254) from the bitmap.
-    fn alloc_tunnel_ip(&mut self) -> Option<u8> {
-        for word_idx in 0..4u8 {
-            let word = self.tunnel_ip_bitmap[word_idx as usize];
-            if word == u64::MAX { continue; } // All 64 bits set
-            let bit = (!word).trailing_zeros() as u8; // First free bit
-            let global_idx = word_idx * 64 + bit;
-            if global_idx >= 255 { continue; } // .255 is broadcast
-            self.tunnel_ip_bitmap[word_idx as usize] |= 1u64 << bit;
-            return Some(global_idx);
-        }
-        None
-    }
-
-    /// Free a tunnel IP index back to the bitmap.
-    fn free_tunnel_ip(&mut self, idx: u8) {
-        let word_idx = (idx / 64) as usize;
-        let bit = idx % 64;
-        self.tunnel_ip_bitmap[word_idx] &= !(1u64 << bit);
-    }
-
-    /// Periodic garbage collection: evict peers with no activity for too long.
-    fn gc(&mut self, now_ns: u64) {
-        let now_rel_s = ((now_ns.saturating_sub(self.epoch_ns)) / 1_000_000_000) as u32;
-        for i in 0..MAX_PEERS {
-            if self.slots[i].is_empty() { continue; }
-            // Evict Registered peers that never completed handshake (60s timeout)
-            if self.slots[i].lifecycle == PeerLifecycle::Registered
-               || self.slots[i].lifecycle == PeerLifecycle::Handshaking {
-                if self.slots[i].established_rel_s == 0 {
-                    // Use a conservative 60s timeout for registration/handshake
-                    // We don't have a per-slot creation timestamp in the 64B slot,
-                    // so we check if the slot has been in this state "too long"
-                    // by using a simple counter approach. For now, don't evict
-                    // non-established peers automatically — they'll get overwritten
-                    // on reconnect.
-                }
-            }
-        }
-        let _ = now_rel_s; // suppress unused warning until we add time-based eviction
-    }
-}
 
 #[inline(always)]
 fn produce_feedback_frame(
@@ -2219,25 +767,51 @@ fn create_tun(name: &str) -> Option<std::fs::File> {
     // Set interface up and assign IP (Hub = 10.13.0.1/24)
     let _ = Command::new("ip").args(&["link", "set", "dev", name, "up"]).output();
     let _ = Command::new("ip").args(&["addr", "add", "10.13.0.1/24", "dev", name]).output();
-    let _ = Command::new("ip").args(&["link", "set", "dev", name, "mtu", "1280"]).output();
+    // MTU 1400: max safe for raw frame path (1500-104=1396), with 4B margin
+    let _ = Command::new("ip").args(&["link", "set", "dev", name, "mtu", "1400"]).output();
+    // txqueuelen 1000: prevent kernel TUN queue drops at burst rates
+    let _ = Command::new("ip").args(&["link", "set", "dev", name, "txqueuelen", "1000"]).output();
 
-    eprintln!("[M13-TUN] Created tunnel interface {} (10.13.0.1/24)", name);
+    eprintln!("[M13-TUN] Created tunnel interface {} (10.13.0.1/24, MTU 1400)", name);
     Some(file)
 }
 
 fn setup_nat() {
-    eprintln!("[M13-NAT] Enabling NAT (Masquerade)...");
+    eprintln!("[M13-NAT] Enabling NAT + TCP BDP tuning...");
     // Enable forwarding
     let _ = Command::new("sysctl").args(&["-w", "net.ipv4.ip_forward=1"]).output();
+
+    // === TCP BDP tuning ===
+    // Tunnel adds RTT (~100-200ms). TCP throughput = window / RTT.
+    // Default rmem_max=208KB → max 8Mbps at 200ms. Raise to 16MB → 640Mbps ceiling.
+    let _ = Command::new("sysctl").args(&["-w", "net.core.rmem_max=16777216"]).output();
+    let _ = Command::new("sysctl").args(&["-w", "net.core.wmem_max=16777216"]).output();
+    let _ = Command::new("sysctl").args(&["-w", "net.ipv4.tcp_rmem=4096 1048576 16777216"]).output();
+    let _ = Command::new("sysctl").args(&["-w", "net.ipv4.tcp_wmem=4096 1048576 16777216"]).output();
+    // Keep cwnd warm between bursts (don't reset after idle)
+    let _ = Command::new("sysctl").args(&["-w", "net.ipv4.tcp_slow_start_after_idle=0"]).output();
+    // Larger NIC backlog for burst absorption
+    let _ = Command::new("sysctl").args(&["-w", "net.core.netdev_max_backlog=10000"]).output();
+    // Enable TCP window scaling (usually default, ensure it's on)
+    let _ = Command::new("sysctl").args(&["-w", "net.ipv4.tcp_window_scaling=1"]).output();
+
+    // TUN qdisc: fq (fair queueing) — absorbs bursts + paces TCP.
+    // noqueue drops instantly when reader can't keep up; fq is production-grade.
+    let _ = Command::new("tc").args(&["qdisc", "replace", "dev", "m13tun0", "root", "fq"]).output();
+
+    // Sprint 4: Restrict MASQUERADE to exclude m13tun0 — prevents double-NAT
+    // on return traffic through the tunnel interface.
+    let _ = Command::new("iptables").args(&["-t", "nat", "-A", "POSTROUTING", "!", "-o", "m13tun0", "-j", "MASQUERADE"]).output();
     
-    // Masquerade all outgoing traffic (lazy NAT)
-    // iptables -t nat -A POSTROUTING -j MASQUERADE
-    let _ = Command::new("iptables").args(&["-t", "nat", "-A", "POSTROUTING", "-j", "MASQUERADE"]).output();
-    
+    // TCP MSS clamping: TUN MTU=1400, so MSS must be ≤ 1360 (1400-40).
+    // Without this, TCP negotiates MSS=1460 (based on remote 1500 MTU),
+    // causing PMTUD blackhole → throughput collapses to ~5 Mbps.
+    let _ = Command::new("iptables").args(&["-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"]).output();
+
     // Allow forwarding between interfaces
     let _ = Command::new("iptables").args(&["-A", "FORWARD", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"]).output();
-    let _ = Command::new("iptables").args(&["-A", "FORWARD", "-o", "m13tun0", "-j", "ACCEPT"]).output();
     let _ = Command::new("iptables").args(&["-A", "FORWARD", "-i", "m13tun0", "-j", "ACCEPT"]).output();
+    let _ = Command::new("iptables").args(&["-A", "FORWARD", "-o", "m13tun0", "-j", "ACCEPT"]).output();
 }
 
 /// Nuclear cleanup: tear down ALL Hub state — NAT, iptables, TUN, XDP.
@@ -2246,7 +820,8 @@ fn nuke_cleanup_hub(if_name: &str) {
     eprintln!("[M13-NUKE] Tearing down all Hub state...");
 
     // 1. Remove iptables NAT and FORWARD rules
-    let _ = Command::new("iptables").args(&["-t", "nat", "-D", "POSTROUTING", "-j", "MASQUERADE"]).output();
+    let _ = Command::new("iptables").args(&["-t", "nat", "-D", "POSTROUTING", "!", "-o", "m13tun0", "-j", "MASQUERADE"]).output();
+    let _ = Command::new("iptables").args(&["-D", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"]).output();
     let _ = Command::new("iptables").args(&["-D", "FORWARD", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"]).output();
     let _ = Command::new("iptables").args(&["-D", "FORWARD", "-o", "m13tun0", "-j", "ACCEPT"]).output();
     let _ = Command::new("iptables").args(&["-D", "FORWARD", "-i", "m13tun0", "-j", "ACCEPT"]).output();
@@ -2351,6 +926,17 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
     let mut closing = false;
     let mut fin_deadline_ns: u64 = 0;
 
+    // === Sprint 4b: Hub header template for TUN→AF_XDP path ===
+    // Pre-stamp static M13 header bytes once. Copy per-packet via single memcpy
+    // instead of 8 individual writes + fill(0). bytes 16..62 already 0.
+    let mut m13_hdr_template = [0u8; 62];
+    m13_hdr_template[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    m13_hdr_template[6..12].copy_from_slice(&src_mac);
+    m13_hdr_template[12] = (ETH_P_M13 >> 8) as u8;
+    m13_hdr_template[13] = (ETH_P_M13 & 0xFF) as u8;
+    m13_hdr_template[14] = M13_WIRE_MAGIC;
+    m13_hdr_template[15] = M13_WIRE_VERSION;
+
     loop {
         // Sprint 5.21: Graceful close protocol.
         // On SHUTDOWN: send 3x FIN, then keep looping (RX only) until FIN-ACK or deadline.
@@ -2403,7 +989,7 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
         // No intermediate tun_buf — BoringTun/Cloudflare pattern.
         if worker_idx == 0 {
             if let Some(ref mut tun_file) = tun {
-                for _tun_batch in 0..64u32 {
+                for _tun_batch in 0..256u32 {
                     // Speculative slab alloc — read directly into UMEM payload region
                     let idx = match slab.alloc() {
                         Some(i) => i,
@@ -2460,22 +1046,14 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                             let m13_flen = ETH_HDR_SIZE + M13_HDR_SIZE + n;
                             unsafe {
                                 let m13_buf = std::slice::from_raw_parts_mut(frame_ptr, FRAME_SIZE as usize);
-                                // Build M13 header (payload already in place at offset 62)
-                                m13_buf[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-                                m13_buf[6..12].copy_from_slice(&src_mac);
-                                m13_buf[12] = (ETH_P_M13 >> 8) as u8;
-                                m13_buf[13] = (ETH_P_M13 & 0xFF) as u8;
-                                m13_buf[14] = M13_WIRE_MAGIC;
-                                m13_buf[15] = M13_WIRE_VERSION;
-                                // Zero signature region [16..46] — CRITICAL: must match Node's
-                                // expectation. Without this, stale UMEM data causes AEAD mismatch.
-                                m13_buf[16..46].fill(0);
+                                // Sprint 4b: Copy pre-built header template (46 static bytes)
+                                // then stamp only variable fields (seq, flags, payload_len).
+                                m13_buf[0..46].copy_from_slice(&m13_hdr_template[0..46]);
                                 let udp_seq = peer_slot.next_seq();
                                 m13_buf[46..54].copy_from_slice(&udp_seq.to_le_bytes());
                                 m13_buf[54] = FLAG_TUNNEL;
                                 m13_buf[55..59].copy_from_slice(&(n as u32).to_le_bytes());
-                                // Zero padding [59..62]
-                                m13_buf[59..62].fill(0);
+                                m13_buf[59..62].copy_from_slice(&m13_hdr_template[59..62]);
                                 // Payload already at [62..62+n] — no copy needed
                                 if let Some(ref cipher) = peers.ciphers[peer_idx] {
                                     seal_frame(&mut m13_buf[..m13_flen], cipher, udp_seq, DIR_HUB_TO_NODE, ETH_HDR_SIZE);
@@ -3031,7 +1609,7 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
         // === STAGE 5: ENQUEUE DATA (full-rate, no pacing) ===
         // Sprint 5.21: When closing, don't send new data — only process RX + FIN.
         if !closing {
-            let tx_budget = scheduler.budget(engine.tx_path.available_slots() as usize, HW_FILL_MAX);
+            let tx_budget = scheduler.budget(TxPath::available_slots(&mut engine.tx_path) as usize, HW_FILL_MAX);
             let forward_count = data_count.min(tx_budget);
             for i in 0..forward_count {
                 let d = &rx_batch[data_indices[i] as usize];
@@ -3051,7 +1629,9 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
         }
 
         // === STAGE 6: SCHEDULE (critical bypasses pacing) ===
-        scheduler.schedule(&mut engine.tx_path, &stats, usize::MAX);
+        let tx_counter = TxCounter::new();
+        scheduler.schedule(&mut engine.tx_path, &tx_counter, usize::MAX);
+        stats.tx_count.value.fetch_add(tx_counter.value.load(Ordering::Relaxed), Ordering::Relaxed);
 
 
 
