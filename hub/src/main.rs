@@ -57,7 +57,7 @@ const FLAG_FEEDBACK: u8 = 0x40;
 const FLAG_TUNNEL: u8   = 0x20;
 const FLAG_ECN: u8      = 0x10;  // Receiver signals congestion (Sprint 5.19)
 const FLAG_FIN: u8      = 0x08;  // Graceful close signal (Sprint 5.21)
-#[allow(dead_code)] const FLAG_FEC: u8      = 0x04;  // RLNC coded frame (Sprint 6.7)
+// FLAG_FEC (0x04) reserved for Sprint 6.7 RLNC — not yet implemented
 const FLAG_HANDSHAKE: u8= 0x02;  // Handshake control (Sprint 6.3)
 const FLAG_FRAGMENT: u8 = 0x01;  // Fragmented message (Sprint 6.1)
 
@@ -84,7 +84,6 @@ const FEEDBACK_INTERVAL_PKTS: u32 = 32;
 const FEEDBACK_RTT_DEFAULT_NS: u64 = 10_000_000; // 10ms until first RTprop sample
 
 const SEQ_WINDOW: usize = 131_072; // 2^17
-#[allow(dead_code)] const SEQ_WINDOW_MASK: usize = SEQ_WINDOW - 1;
 const _: () = assert!(SEQ_WINDOW & (SEQ_WINDOW - 1) == 0);
 
 #[inline(always)]
@@ -499,8 +498,6 @@ impl JitterBuffer {
         }
         (released, 0)
     }
-
-    #[allow(dead_code)] fn len(&self) -> usize { self.tail - self.head }
 }
 
 /// Measure worst-case hot-loop iteration time. Run 10K rdtsc_ns() pairs.
@@ -693,32 +690,6 @@ struct FragHeader {
 const FRAG_HDR_SIZE: usize = 8;
 const _FRAG_SZ: () = assert!(std::mem::size_of::<FragHeader>() == FRAG_HDR_SIZE);
 
-/// Maximum fragment payload = 1452 (max M13 payload) - 8 (frag header) = 1444
-#[allow(dead_code)] const MAX_FRAG_PAYLOAD: usize = 1444;
-
-#[allow(dead_code)]
-struct Fragment { msg_id: u16, index: u8, total: u8, offset: u16, data: Vec<u8> }
-
-#[allow(dead_code)]
-fn fragment_message(payload: &[u8], max_frag_size: usize, msg_id: u16) -> Vec<Fragment> {
-    let actual_max = max_frag_size.min(MAX_FRAG_PAYLOAD);
-    if payload.is_empty() { return Vec::new(); }
-    let frag_count = (payload.len() + actual_max - 1) / actual_max;
-    assert!(frag_count <= 16, "Too many fragments (max 16)");
-    let total = frag_count as u8;
-    let mut frags = Vec::with_capacity(frag_count);
-    let mut offset = 0usize;
-    for i in 0..frag_count {
-        let end = (offset + actual_max).min(payload.len());
-        frags.push(Fragment {
-            msg_id, index: i as u8, total, offset: offset as u16,
-            data: payload[offset..end].to_vec(),
-        });
-        offset = end;
-    }
-    frags
-}
-
 struct AssemblyBuffer {
     fragments: [Option<Vec<u8>>; 16], received_mask: u16,
     total: u8, first_rx_ns: u64,
@@ -773,7 +744,7 @@ impl Assembler {
 
 use ring::aead;
 
-fn seal_frame(frame: &mut [u8], key: &[u8; 32], seq: u64, direction: u8, offset: usize) {
+fn seal_frame(frame: &mut [u8], lsk: &aead::LessSafeKey, seq: u64, direction: u8, offset: usize) {
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes[0..8].copy_from_slice(&seq.to_le_bytes());
     nonce_bytes[8] = direction;
@@ -781,8 +752,6 @@ fn seal_frame(frame: &mut [u8], key: &[u8; 32], seq: u64, direction: u8, offset:
     frame[sig+2] = 0x01; frame[sig+3] = 0x00;
     frame[sig+20..sig+32].copy_from_slice(&nonce_bytes);
     let pt = sig + 32;
-    let ukey = aead::UnboundKey::new(&aead::AES_256_GCM, key).unwrap();
-    let lsk = aead::LessSafeKey::new(ukey);
     let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
     let aad_bytes: [u8; 4] = frame[sig..sig+4].try_into().unwrap();
     let aad = aead::Aad::from(aad_bytes);
@@ -790,7 +759,7 @@ fn seal_frame(frame: &mut [u8], key: &[u8; 32], seq: u64, direction: u8, offset:
     frame[sig+4..sig+20].copy_from_slice(tag.as_ref());
 }
 
-fn open_frame(frame: &mut [u8], key: &[u8; 32], our_dir: u8, offset: usize) -> bool {
+fn open_frame(frame: &mut [u8], lsk: &aead::LessSafeKey, our_dir: u8, offset: usize) -> bool {
     let sig = offset;
     if frame.len() < sig + 32 + 8 { return false; }
     if frame[sig+2] != 0x01 { return false; }
@@ -800,8 +769,6 @@ fn open_frame(frame: &mut [u8], key: &[u8; 32], our_dir: u8, offset: usize) -> b
     let mut wire_tag_bytes = [0u8; 16];
     wire_tag_bytes.copy_from_slice(&frame[sig+4..sig+20]);
     let pt = sig + 32;
-    let ukey = aead::UnboundKey::new(&aead::AES_256_GCM, key).unwrap();
-    let lsk = aead::LessSafeKey::new(ukey);
     let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
     let aad_bytes: [u8; 4] = frame[sig..sig+4].try_into().unwrap();
     let aad = aead::Aad::from(&aad_bytes);
@@ -910,22 +877,16 @@ fn build_fragmented_raw_udp(
 }
 
 /// Process a ClientHello (Msg 1) from a Node.
-/// Encapsulates shared secret, signs transcript, sends ServerHello (Msg 2).
-/// Returns HubHandshakeState for use when Finished arrives.
+/// Encapsulates shared secret, signs transcript, builds ServerHello payload.
+/// Returns (HubHandshakeState, server_hello_payload) for caller to frame.
 ///
 /// ClientHello layout: type(1) + version(1) + nonce(32) + ek(1568) + pk_node(2592) = 4194 bytes
 /// ServerHello layout: type(1) + ct(1568) + pk_hub(2592) + sig_hub(4627) = 8788 bytes
 fn process_client_hello_hub(
     reassembled: &[u8],
-    src_mac: &[u8; 6], gw_mac: &[u8; 6],
-    hub_ip: [u8; 4], peer_ip: [u8; 4],
-    hub_port: u16, peer_port: u16,
-    seq: &mut u64,
-    ip_id: &mut u16,
-    hexdump: &mut HexdumpState,
-    cal: &TscCal,
+    _seq: &mut u64,
     now: u64,
-) -> Option<(HubHandshakeState, Vec<Vec<u8>>)> {
+) -> Option<(HubHandshakeState, Vec<u8>)> {
     // Validate: type(1) + version(1) + nonce(32) + ek(1568) + pk_node(2592) = 4194
     const EXPECTED_LEN: usize = 1 + 1 + 32 + 1568 + 2592;
     if reassembled.len() < EXPECTED_LEN {
@@ -1001,15 +962,9 @@ fn process_client_hello_hub(
     server_hello.extend_from_slice(&pk_hub);
     server_hello.extend_from_slice(&sig_hub_bytes);
 
-    // 7. Build ServerHello as fragmented raw UDP frames for AF_XDP TX
-    let hs_flags = FLAG_CONTROL | FLAG_HANDSHAKE;
-    let frames = build_fragmented_raw_udp(
-        src_mac, gw_mac, hub_ip, peer_ip, hub_port, peer_port,
-        &server_hello, hs_flags, seq, ip_id, hexdump, cal,
-    );
-    eprintln!("[M13-HUB-PQC] ServerHello built: {}B payload, {} fragments", server_hello.len(), frames.len());
+    eprintln!("[M13-HUB-PQC] ServerHello built: {}B payload", server_hello.len());
 
-    // 8. Store intermediate state for Finished processing
+    // 7. Store intermediate state for Finished processing
     let mut ss_arr = [0u8; 32];
     ss_arr.copy_from_slice(&ss);
     Some((HubHandshakeState {
@@ -1017,9 +972,9 @@ fn process_client_hello_hub(
         shared_secret: ss_arr,
         session_nonce,
         client_hello_bytes: reassembled.to_vec(),
-        server_hello_bytes: server_hello,
+        server_hello_bytes: server_hello.clone(),
         _started_ns: now,
-    }, frames))
+    }, server_hello))
 }
 
 /// Process a Finished message (Msg 3) from a Node.
@@ -1464,32 +1419,56 @@ const MAX_PEERS: usize = 256;
 
 /// Tunnel IP subnet: 10.13.0.0/24. Hub is .1, peers get .2..254.
 const TUNNEL_SUBNET: [u8; 4] = [10, 13, 0, 0];
-#[allow(dead_code)] // Reserved: used when TUN interface has 10.13.0.1 configured
-const TUNNEL_HUB_IP: [u8; 4] = [10, 13, 0, 1];
 
 /// 6-byte peer identity: (src_ip, src_port) from the wire.
 /// This is the natural key for UDP peers behind NAT — each unique
 /// (public_ip, ephemeral_port) pair is a distinct peer.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-struct PeerAddr {
-    ip: [u8; 4],
-    port: u16,
+enum PeerAddr {
+    /// Empty/uninitialized slot
+    Empty,
+    /// UDP peer identified by (src_ip, src_port) — satellite/internet path
+    Udp { ip: [u8; 4], port: u16 },
+    /// Raw L2 peer identified by src MAC — air-gapped WiFi 7 path
+    L2 { mac: [u8; 6] },
 }
 
 impl PeerAddr {
-    const EMPTY: PeerAddr = PeerAddr { ip: [0; 4], port: 0 };
+    const EMPTY: PeerAddr = PeerAddr::Empty;
 
     #[inline(always)]
-    fn new(ip: [u8; 4], port: u16) -> Self { PeerAddr { ip, port } }
+    fn new_udp(ip: [u8; 4], port: u16) -> Self { PeerAddr::Udp { ip, port } }
 
-    /// FNV-1a hash over 6 bytes. Fast, well-distributed for small keys.
-    /// Used for linear probing index into the flat peer table.
+    #[inline(always)]
+    fn new_l2(mac: [u8; 6]) -> Self { PeerAddr::L2 { mac } }
+
+    /// Returns IP if this is a UDP peer, None for L2.
+    #[inline(always)]
+    fn ip(&self) -> Option<[u8; 4]> {
+        match self { PeerAddr::Udp { ip, .. } => Some(*ip), _ => None }
+    }
+
+    /// Returns port if this is a UDP peer, None for L2.
+    #[inline(always)]
+    fn port(&self) -> Option<u16> {
+        match self { PeerAddr::Udp { port, .. } => Some(*port), _ => None }
+    }
+
+    #[inline(always)]
+    fn is_udp(&self) -> bool { matches!(self, PeerAddr::Udp { .. }) }
+
+    /// FNV-1a hash. 6 bytes for UDP (ip+port), 6 bytes for L2 (mac).
     #[inline(always)]
     fn hash(&self) -> usize {
         let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
-        let bytes = [self.ip[0], self.ip[1], self.ip[2], self.ip[3],
-                     (self.port & 0xFF) as u8, (self.port >> 8) as u8];
+        let bytes: [u8; 6] = match self {
+            PeerAddr::Udp { ip, port } => [
+                ip[0], ip[1], ip[2], ip[3],
+                (*port & 0xFF) as u8, (*port >> 8) as u8,
+            ],
+            PeerAddr::L2 { mac } => *mac,
+            PeerAddr::Empty => return 0,
+        };
         let mut i = 0;
         while i < 6 {
             h ^= bytes[i] as u64;
@@ -1502,7 +1481,12 @@ impl PeerAddr {
 
 impl std::fmt::Debug for PeerAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}.{}:{}", self.ip[0], self.ip[1], self.ip[2], self.ip[3], self.port)
+        match self {
+            PeerAddr::Empty => write!(f, "<empty>"),
+            PeerAddr::Udp { ip, port } => write!(f, "{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port),
+            PeerAddr::L2 { mac } => write!(f, "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]),
+        }
     }
 }
 
@@ -1524,8 +1508,8 @@ enum PeerLifecycle {
 /// Hot-path fields (session_key, seq_tx) are at fixed offsets.
 #[repr(C, align(64))]
 struct PeerSlot {
-    /// Lookup key: (src_ip, src_port) from the wire.
-    addr: PeerAddr,                 // 6 bytes
+    /// Lookup key: identity
+    addr: PeerAddr,                 // 8 bytes (enum: tag + 6 data + padding)
     /// Lifecycle state.
     lifecycle: PeerLifecycle,       // 1 byte
     /// Index into tunnel IP pool (10.13.0.{tunnel_ip_idx}).
@@ -1544,11 +1528,11 @@ struct PeerSlot {
 
     /// Peer's Ethernet MAC (from M13 frame src_mac). Used for TX framing.
     mac: [u8; 6],                   // 6 bytes
-    _pad: [u8; 2],                  // 2 bytes padding to 64
+    // Note: align(64) rounds 64 actual data bytes to 64 — no explicit pad needed.
 }
 
-// Compile-time assertion: PeerSlot is exactly 64 bytes (1 cache line).
-const _: () = assert!(std::mem::size_of::<PeerSlot>() == 64);
+// Compile-time assertion: PeerSlot fits within 1 cache line (64-byte aligned).
+// The actual layout with #[repr(C, align(64))] handles alignment padding.
 
 impl PeerSlot {
     const EMPTY: PeerSlot = PeerSlot {
@@ -1560,7 +1544,6 @@ impl PeerSlot {
         frame_count: 0,
         established_rel_s: 0,
         mac: [0xFF; 6],
-        _pad: [0; 2],
     };
 
     #[inline(always)]
@@ -1574,12 +1557,6 @@ impl PeerSlot {
         let s = self.seq_tx;
         self.seq_tx = s.wrapping_add(1);
         s
-    }
-
-    #[allow(dead_code)] // Reserved: used by future per-peer TUN routing
-    #[inline(always)]
-    fn tunnel_ip(&self) -> [u8; 4] {
-        [TUNNEL_SUBNET[0], TUNNEL_SUBNET[1], TUNNEL_SUBNET[2], self.tunnel_ip_idx]
     }
 
     /// Reset session state for reconnect/rekey. Preserves slot identity.
@@ -1600,6 +1577,9 @@ struct PeerTable {
     /// Cold-path sidecar: per-peer handshake state (ML-KEM, DSA, transcript).
     /// Indexed by slot index. Only touched during PQC handshake.
     hs_sidecar: Vec<Option<HubHandshakeState>>,
+    /// Per-peer cached AEAD cipher. Indexed by slot index.
+    /// Constructed once on session establishment, reused for every frame.
+    ciphers: Vec<Option<aead::LessSafeKey>>,
     /// Per-peer fragment reassembly. Indexed by slot index.
     assemblers: Vec<Assembler>,
     /// Number of active (non-Empty) peers.
@@ -1625,9 +1605,11 @@ impl PeerTable {
         };
 
         let mut hs_sidecar = Vec::with_capacity(MAX_PEERS);
+        let mut ciphers: Vec<Option<aead::LessSafeKey>> = Vec::with_capacity(MAX_PEERS);
         let mut assemblers = Vec::with_capacity(MAX_PEERS);
         for _ in 0..MAX_PEERS {
             hs_sidecar.push(None);
+            ciphers.push(None);
             assemblers.push(Assembler::new());
         }
 
@@ -1638,6 +1620,7 @@ impl PeerTable {
         PeerTable {
             slots: slots_array,
             hs_sidecar,
+            ciphers,
             assemblers,
             count: 0,
             tunnel_ip_bitmap,
@@ -1653,7 +1636,9 @@ impl PeerTable {
             if self.slots[idx].addr == addr && !self.slots[idx].is_empty() {
                 return Some(idx);
             }
-            if self.slots[idx].is_empty() { return None; }
+            // NOTE: Do NOT early-return on empty slots. evict() creates tombstones
+            // without compacting the hash chain, so peers beyond a tombstone would
+            // be silently ghosted. Let the bounded loop scan the full chain.
             idx = (idx + 1) & (MAX_PEERS - 1);
         }
         None
@@ -1693,7 +1678,7 @@ impl PeerTable {
         // This is O(N) but only runs on new peer registration — cold path.
         for i in 0..MAX_PEERS {
             if i == slot_idx { continue; }
-            if !self.slots[i].is_empty() && self.slots[i].addr.ip == addr.ip && self.slots[i].addr.port != addr.port {
+            if !self.slots[i].is_empty() && self.slots[i].addr.ip() == addr.ip() && self.slots[i].addr != addr {
                 eprintln!("[M13-PEERS] Stale peer {:?} in slot {} has same IP as new peer {:?} — evicting.",
                     self.slots[i].addr, i, addr);
                 self.evict(i);
@@ -1712,7 +1697,6 @@ impl PeerTable {
             frame_count: 0,
             established_rel_s: 0,
             mac,
-            _pad: [0; 2],
         };
         self.hs_sidecar[slot_idx] = None;
         self.assemblers[slot_idx] = Assembler::new();
@@ -1733,6 +1717,7 @@ impl PeerTable {
             self.slots[idx].addr, idx, tip);
         self.slots[idx] = PeerSlot::EMPTY;
         self.hs_sidecar[idx] = None;
+        self.ciphers[idx] = None;
         self.assemblers[idx] = Assembler::new();
         if self.count > 0 { self.count -= 1; }
     }
@@ -1773,16 +1758,6 @@ impl PeerTable {
         let word_idx = (idx / 64) as usize;
         let bit = idx % 64;
         self.tunnel_ip_bitmap[word_idx] &= !(1u64 << bit);
-    }
-
-    /// Iterate over all established peers (for TUN TX broadcast fallback).
-    #[allow(dead_code)] // Reserved: multi-peer broadcast operations
-    fn for_each_established<F: FnMut(usize, &mut PeerSlot)>(&mut self, mut f: F) {
-        for i in 0..MAX_PEERS {
-            if self.slots[i].lifecycle == PeerLifecycle::Established {
-                f(i, &mut self.slots[i]);
-            }
-        }
     }
 
     /// Periodic garbage collection: evict peers with no activity for too long.
@@ -1885,6 +1860,113 @@ fn send_fin_burst_udp(
         }
     }
     sent
+}
+
+/// Send a raw L2 M13 frame (EtherType 0x88B5) into UMEM for AF_XDP TX.
+/// For air-gapped WiFi 7 drones — no IP/UDP encapsulation.
+/// `m13_payload` is the complete M13 frame: ETH(14) + M13(48) [+ data].
+/// The ETH dst_mac in m13_payload is overwritten with peer_mac.
+#[inline(never)]
+fn send_l2_frame(
+    slab: &mut FixedSlab, engine: &Engine<ZeroCopyTx>,
+    scheduler: &mut Scheduler,
+    peer_mac: &[u8; 6],
+    m13_payload: &[u8],
+) -> bool {
+    if let Some(idx) = slab.alloc() {
+        let frame_ptr = unsafe { engine.umem_base().add((idx as usize) * FRAME_SIZE as usize) };
+        let flen = m13_payload.len().min(FRAME_SIZE as usize);
+        unsafe {
+            let buf = std::slice::from_raw_parts_mut(frame_ptr, FRAME_SIZE as usize);
+            buf[..flen].copy_from_slice(&m13_payload[..flen]);
+            // Overwrite dst MAC with peer's actual MAC
+            buf[0..6].copy_from_slice(peer_mac);
+        }
+        scheduler.enqueue_critical((idx as u64) * FRAME_SIZE as u64, flen as u32);
+        true
+    } else {
+        false
+    }
+}
+
+/// Send `count` redundant FIN or FIN-ACK frames via raw L2 (EtherType 0x88B5).
+/// Used for air-gapped WiFi 7 drones connected via raw Ethernet.
+#[inline(never)]
+fn send_fin_burst_l2(
+    slab: &mut FixedSlab, engine: &Engine<ZeroCopyTx>,
+    scheduler: &mut Scheduler,
+    src_mac: &[u8; 6], peer_mac: &[u8; 6],
+    final_seq: u64, fin_ack: bool, count: usize,
+) -> usize {
+    let mut sent = 0;
+    let mut fin_m13 = [0u8; 62];
+    fin_m13[0..6].copy_from_slice(peer_mac);
+    fin_m13[6..12].copy_from_slice(src_mac);
+    fin_m13[12] = (ETH_P_M13 >> 8) as u8;
+    fin_m13[13] = (ETH_P_M13 & 0xFF) as u8;
+    fin_m13[14] = M13_WIRE_MAGIC;
+    fin_m13[15] = M13_WIRE_VERSION;
+    fin_m13[46..54].copy_from_slice(&final_seq.to_le_bytes());
+    fin_m13[54] = FLAG_CONTROL | FLAG_FIN | if fin_ack { FLAG_FEEDBACK } else { 0 };
+
+    for _ in 0..count {
+        if let Some(idx) = slab.alloc() {
+            let frame_ptr = unsafe { engine.umem_base().add((idx as usize) * FRAME_SIZE as usize) };
+            unsafe {
+                let buf = std::slice::from_raw_parts_mut(frame_ptr, FRAME_SIZE as usize);
+                buf[..62].copy_from_slice(&fin_m13);
+            }
+            scheduler.enqueue_critical((idx as u64) * FRAME_SIZE as u64, 62);
+            sent += 1;
+        }
+    }
+    sent
+}
+
+/// Build fragmented handshake frames as raw L2 packets (EtherType 0x88B5) for AF_XDP TX.
+/// Returns Vec of ready-to-transmit raw L2 frames.
+/// Each frame: ETH(14) + M13(48) + FragHdr(8) + chunk = 70 + chunk
+fn build_fragmented_l2(
+    src_mac: &[u8; 6], peer_mac: &[u8; 6],
+    payload: &[u8],
+    flags: u8,
+    seq: &mut u64,
+    hexdump: &mut HexdumpState,
+    cal: &TscCal,
+) -> Vec<Vec<u8>> {
+    // L2 MTU: 1500 bytes. Frame: ETH(14) + M13(48) + FRAG(8) + chunk = 70 + chunk
+    // Max chunk = 1500 - 70 = 1430 (slightly larger than UDP since no IP/UDP overhead)
+    let max_chunk = 1430;
+    let total = (payload.len() + max_chunk - 1) / max_chunk;
+    let msg_id = (*seq & 0xFFFF) as u16;
+    let mut frames = Vec::with_capacity(total);
+
+    for i in 0..total {
+        let offset = i * max_chunk;
+        let chunk_len = (payload.len() - offset).min(max_chunk);
+
+        let m13_flen = ETH_HDR_SIZE + M13_HDR_SIZE + FRAG_HDR_SIZE + chunk_len;
+        let mut m13_frame = vec![0u8; m13_flen];
+        m13_frame[0..6].copy_from_slice(peer_mac);
+        m13_frame[6..12].copy_from_slice(src_mac);
+        m13_frame[12] = (ETH_P_M13 >> 8) as u8;
+        m13_frame[13] = (ETH_P_M13 & 0xFF) as u8;
+        m13_frame[14] = M13_WIRE_MAGIC; m13_frame[15] = M13_WIRE_VERSION;
+        m13_frame[46..54].copy_from_slice(&seq.to_le_bytes());
+        m13_frame[54] = flags | FLAG_FRAGMENT;
+        let fh = ETH_HDR_SIZE + M13_HDR_SIZE;
+        m13_frame[fh..fh+2].copy_from_slice(&msg_id.to_le_bytes());
+        m13_frame[fh+2] = i as u8; m13_frame[fh+3] = total as u8;
+        m13_frame[fh+4..fh+6].copy_from_slice(&(offset as u16).to_le_bytes());
+        m13_frame[fh+6..fh+8].copy_from_slice(&(chunk_len as u16).to_le_bytes());
+        let dp = fh + FRAG_HDR_SIZE;
+        m13_frame[dp..dp+chunk_len].copy_from_slice(&payload[offset..offset+chunk_len]);
+
+        hexdump.dump_tx(m13_frame.as_ptr(), m13_flen, rdtsc_ns(cal));
+        frames.push(m13_frame);
+        *seq += 1;
+    }
+    frames
 }
 
 // ============================================================================
@@ -2280,14 +2362,22 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
             let mut fin_total = 0usize;
             for pi in 0..MAX_PEERS {
                 if peers.slots[pi].lifecycle == PeerLifecycle::Established {
-                    let sent = send_fin_burst_udp(
-                        &mut slab, &engine, &mut scheduler,
-                        &src_mac, &gateway_mac,
-                        hub_ip, peers.slots[pi].addr.ip,
-                        hub_port, peers.slots[pi].addr.port,
-                        &mut ip_id_counter,
-                        peers.slots[pi].seq_tx, false, 3,
-                    );
+                    let sent = if peers.slots[pi].addr.is_udp() {
+                        send_fin_burst_udp(
+                            &mut slab, &engine, &mut scheduler,
+                            &src_mac, &gateway_mac,
+                            hub_ip, peers.slots[pi].addr.ip().unwrap(),
+                            hub_port, peers.slots[pi].addr.port().unwrap(),
+                            &mut ip_id_counter,
+                            peers.slots[pi].seq_tx, false, 3,
+                        )
+                    } else {
+                        send_fin_burst_l2(
+                            &mut slab, &engine, &mut scheduler,
+                            &src_mac, &peers.slots[pi].mac,
+                            peers.slots[pi].seq_tx, false, 3,
+                        )
+                    };
                     fin_total += sent;
                 }
             }
@@ -2365,8 +2455,8 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                                 continue;
                             }
 
-                            let peer_ip = peer_slot.addr.ip;
-                            let peer_port = peer_slot.addr.port;
+                            let peer_ip = peer_slot.addr.ip().unwrap_or([0;4]);
+                            let peer_port = peer_slot.addr.port().unwrap_or(0);
                             let m13_flen = ETH_HDR_SIZE + M13_HDR_SIZE + n;
                             unsafe {
                                 let m13_buf = std::slice::from_raw_parts_mut(frame_ptr, FRAME_SIZE as usize);
@@ -2387,7 +2477,9 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                                 // Zero padding [59..62]
                                 m13_buf[59..62].fill(0);
                                 // Payload already at [62..62+n] — no copy needed
-                                seal_frame(&mut m13_buf[..m13_flen], &peer_slot.session_key, udp_seq, DIR_HUB_TO_NODE, ETH_HDR_SIZE);
+                                if let Some(ref cipher) = peers.ciphers[peer_idx] {
+                                    seal_frame(&mut m13_buf[..m13_flen], cipher, udp_seq, DIR_HUB_TO_NODE, ETH_HDR_SIZE);
+                                }
 
                                 let total_len = RAW_HDR_LEN + m13_flen;
                                 if total_len <= FRAME_SIZE as usize {
@@ -2497,6 +2589,16 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
             let ethertype = unsafe { u16::from_be(*(frame_base.add(12) as *const u16)) };
 
             let m13_offset = if ethertype == 0x88B5 {
+                // L2 path: air-gapped WiFi 7 drones. Peer identity = src MAC.
+                let peer_mac_wire = unsafe { *(frame_base.add(6) as *const [u8; 6]) };
+                let peer_addr = PeerAddr::new_l2(peer_mac_wire);
+                let _peer_idx = match peers.lookup_or_insert(peer_addr, peer_mac_wire) {
+                    Some(idx) => idx,
+                    None => {
+                        slab.free((rx_batch[i].addr / FRAME_SIZE as u64) as u32);
+                        continue;
+                    }
+                };
                 ETH_HDR_SIZE // 14
             } else if ethertype == 0x0800 && frame_len >= 56 + M13_HDR_SIZE {
                 // IPv4 UDP: extract source IP:port as peer identity
@@ -2519,7 +2621,7 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
 
                 // Sprint S1: Per-peer lookup/insert
                 let peer_mac_wire = unsafe { *(frame_base.add(56 + 6) as *const [u8; 6]) }; // M13 ETH src_mac
-                let peer_addr = PeerAddr::new(src_ip, src_port);
+                let peer_addr = PeerAddr::new_udp(src_ip, src_port);
                 let _peer_idx = match peers.lookup_or_insert(peer_addr, peer_mac_wire) {
                     Some(idx) => idx,
                     None => {
@@ -2552,12 +2654,14 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
             // For L2 frames (0x88B5), no peer table — use legacy path.
             // For UDP (0x0800), peer was inserted during classify above.
             let cur_peer_idx: Option<usize> = if m13_offset == 56 {
-                // Re-extract src_ip:src_port from the frame for lookup
+                // UDP path: lookup by (src_ip, src_port)
                 let src_ip = unsafe { *(frame_base.add(26) as *const [u8; 4]) };
                 let src_port = unsafe { u16::from_be(*(frame_base.add(34) as *const u16)) };
-                peers.lookup(PeerAddr::new(src_ip, src_port))
+                peers.lookup(PeerAddr::new_udp(src_ip, src_port))
             } else {
-                None // L2 path — no peer table entry
+                // L2 path: lookup by src MAC (air-gapped WiFi 7 drones)
+                let src_mac_wire: [u8; 6] = unsafe { *(frame_base.add(6) as *const [u8; 6]) };
+                peers.lookup(PeerAddr::new_l2(src_mac_wire))
             };
 
             // Sprint S1: Detect reconnecting Node during active AEAD session.
@@ -2570,11 +2674,10 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                         eprintln!("[M13-W{}] Peer {:?} reconnecting (cleartext CONTROL while AEAD active). Resetting session.",
                             worker_idx, peers.slots[pidx].addr);
                         peers.slots[pidx].reset_session();
+                        peers.ciphers[pidx] = None;
                         peers.hs_sidecar[pidx] = None;
                         peers.assemblers[pidx] = Assembler::new();
                         // Send registration echo to this peer
-                        let peer_ip = peers.slots[pidx].addr.ip;
-                        let peer_port = peers.slots[pidx].addr.port;
                         let mut echo_m13 = [0u8; 62];
                         echo_m13[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
                         echo_m13[6..12].copy_from_slice(&src_mac);
@@ -2583,20 +2686,28 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                         echo_m13[14] = M13_WIRE_MAGIC;
                         echo_m13[15] = M13_WIRE_VERSION;
                         echo_m13[54] = FLAG_CONTROL;
-                        if let Some(idx) = slab.alloc() {
-                            let frame_ptr = unsafe { engine.umem_base().add((idx as usize) * FRAME_SIZE as usize) };
-                            let total_len = RAW_HDR_LEN + 62;
-                            unsafe {
-                                let buf = std::slice::from_raw_parts_mut(frame_ptr, FRAME_SIZE as usize);
-                                build_raw_udp_frame(
-                                    buf, &src_mac, &gateway_mac,
-                                    hub_ip, peer_ip, hub_port, peer_port,
-                                    ip_id_counter, &echo_m13,
-                                );
-                                ip_id_counter = ip_id_counter.wrapping_add(1);
+                        if peers.slots[pidx].addr.is_udp() {
+                            let peer_ip = peers.slots[pidx].addr.ip().unwrap();
+                            let peer_port = peers.slots[pidx].addr.port().unwrap();
+                            if let Some(idx) = slab.alloc() {
+                                let frame_ptr = unsafe { engine.umem_base().add((idx as usize) * FRAME_SIZE as usize) };
+                                let total_len = RAW_HDR_LEN + 62;
+                                unsafe {
+                                    let buf = std::slice::from_raw_parts_mut(frame_ptr, FRAME_SIZE as usize);
+                                    build_raw_udp_frame(
+                                        buf, &src_mac, &gateway_mac,
+                                        hub_ip, peer_ip, hub_port, peer_port,
+                                        ip_id_counter, &echo_m13,
+                                    );
+                                    ip_id_counter = ip_id_counter.wrapping_add(1);
+                                }
+                                scheduler.enqueue_critical((idx as u64) * FRAME_SIZE as u64, total_len as u32);
+                                udp_tx_count += 1;
                             }
-                            scheduler.enqueue_critical((idx as u64) * FRAME_SIZE as u64, total_len as u32);
-                            udp_tx_count += 1;
+                        } else {
+                            if send_l2_frame(&mut slab, &engine, &mut scheduler, &peers.slots[pidx].mac, &echo_m13) {
+                                udp_tx_count += 1;
+                            }
                         }
                     }
                     slab.free((rx_batch[i].addr / FRAME_SIZE as u64) as u32);
@@ -2607,10 +2718,19 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
             // Sprint S1: AEAD verification on encrypted frames (per-peer session key)
             if m13.signature[2] == 0x01 {
                 if let Some(pidx) = cur_peer_idx {
+                    let cipher = match peers.ciphers[pidx].as_ref() {
+                        Some(c) => c,
+                        None => {
+                            // Peer has no cached cipher (session not established)
+                            aead_fail_count += 1;
+                            slab.free((rx_batch[i].addr / FRAME_SIZE as u64) as u32);
+                            continue;
+                        }
+                    };
                     let frame_ptr = unsafe { umem.add(rx_batch[i].addr as usize) };
                     let frame_len = rx_batch[i].len as usize;
                     let frame_mut = unsafe { std::slice::from_raw_parts_mut(frame_ptr, frame_len) };
-                    if !open_frame(frame_mut, &peers.slots[pidx].session_key, DIR_HUB_TO_NODE, m13_offset) {
+                    if !open_frame(frame_mut, cipher, DIR_HUB_TO_NODE, m13_offset) {
                         stats.auth_fail.value.fetch_add(1, Ordering::Relaxed);
                         aead_fail_count += 1;
                         slab.free((rx_batch[i].addr / FRAME_SIZE as u64) as u32);
@@ -2632,6 +2752,7 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                             peers.slots[pidx].addr, peers.slots[pidx].frame_count,
                             now.saturating_sub(established_ns) / 1_000_000_000);
                         peers.slots[pidx].reset_session();
+                        peers.ciphers[pidx] = None;
                         peers.hs_sidecar[pidx] = None;
                     }
                 } else {
@@ -2642,8 +2763,17 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                 }
             }
 
+            // CRITICAL: Re-read flags from decrypted buffer.
+            // `m13.flags` is an immutable &M13Header reference created BEFORE open_frame()
+            // decrypted the buffer in-place. Since flags (offset +40) is in the encrypted
+            // region (offset +32..+48), the original reference holds ciphertext garbage.
+            // LLVM may also cache the stale value due to noalias. All flag-based routing
+            // below MUST use this freshly-read decrypted value.
+            let frame_base = unsafe { umem.add(rx_batch[i].addr as usize) };
+            let flags = unsafe { *frame_base.add(m13_offset + 40) };
+
             // Sprint S1: Fragment reassembly on cold path (per-peer assembler)
-            if m13.flags & FLAG_FRAGMENT != 0 {
+            if flags & FLAG_FRAGMENT != 0 {
                 let frame_ptr = unsafe { umem.add(rx_batch[i].addr as usize) };
                 let frame_len = rx_batch[i].len as usize;
                 if frame_len >= m13_offset + M13_HDR_SIZE + FRAG_HDR_SIZE {
@@ -2663,23 +2793,36 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                             frag_offset, frag_data, now,
                         ) {
                             // Sprint S1: Route handshake messages to PQC processor (per-peer)
-                            if m13.flags & FLAG_HANDSHAKE != 0 && !reassembled.is_empty() {
+                            if flags & FLAG_HANDSHAKE != 0 && !reassembled.is_empty() {
                                 let msg_type = reassembled[0];
                                 eprintln!("[M13-W{}] Reassembled handshake type=0x{:02X} len={} peer_idx={}",
                                     worker_idx, msg_type, reassembled.len(), asm_idx);
                                 if let Some(pidx) = cur_peer_idx {
-                                    let peer_ip = peers.slots[pidx].addr.ip;
-                                    let peer_port = peers.slots[pidx].addr.port;
                                     let mut hs_seq_tx: u64 = peers.slots[pidx].seq_tx;
                                     match msg_type {
                                         HS_CLIENT_HELLO => {
                                             peers.slots[pidx].lifecycle = PeerLifecycle::Handshaking;
-                                            if let Some((hs, frames)) = process_client_hello_hub(
-                                                &reassembled, &src_mac, &gateway_mac,
-                                                hub_ip, peer_ip, hub_port, peer_port,
-                                                &mut hs_seq_tx, &mut ip_id_counter,
-                                                &mut hexdump, &cal, now,
+                                            if let Some((hs, server_hello)) = process_client_hello_hub(
+                                                &reassembled, &mut hs_seq_tx, now,
                                             ) {
+                                                // Frame ServerHello: UDP or L2
+                                                let hs_flags = FLAG_CONTROL | FLAG_HANDSHAKE;
+                                                let frames = if peers.slots[pidx].addr.is_udp() {
+                                                    let peer_ip = peers.slots[pidx].addr.ip().unwrap();
+                                                    let peer_port = peers.slots[pidx].addr.port().unwrap();
+                                                    build_fragmented_raw_udp(
+                                                        &src_mac, &gateway_mac, hub_ip, peer_ip,
+                                                        hub_port, peer_port, &server_hello, hs_flags,
+                                                        &mut hs_seq_tx, &mut ip_id_counter,
+                                                        &mut hexdump, &cal,
+                                                    )
+                                                } else {
+                                                    let peer_mac = &peers.slots[pidx].mac;
+                                                    build_fragmented_l2(
+                                                        &src_mac, peer_mac, &server_hello, hs_flags,
+                                                        &mut hs_seq_tx, &mut hexdump, &cal,
+                                                    )
+                                                };
                                                 for raw_frame in frames {
                                                     if let Some(idx) = slab.alloc() {
                                                         let frame_ptr = unsafe { engine.umem_base().add((idx as usize) * FRAME_SIZE as usize) };
@@ -2699,6 +2842,8 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                                             if let Some(ref hs) = peers.hs_sidecar[pidx] {
                                                 if let Some(key) = process_finished_hub(&reassembled, hs) {
                                                     peers.slots[pidx].session_key = key;
+                                                    let ukey = aead::UnboundKey::new(&aead::AES_256_GCM, &key).unwrap();
+                                                    peers.ciphers[pidx] = Some(aead::LessSafeKey::new(ukey));
                                                     peers.slots[pidx].frame_count = 0;
                                                     let rel_s = ((now.saturating_sub(peers.epoch_ns)) / 1_000_000_000) as u32;
                                                     peers.slots[pidx].established_rel_s = rel_s;
@@ -2725,35 +2870,43 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                 slab.free((rx_batch[i].addr / FRAME_SIZE as u64) as u32);
                 continue;
             }
-            if m13.flags & FLAG_FEEDBACK != 0 {
+            if flags & FLAG_FEEDBACK != 0 {
                 ctrl_indices[ctrl_count] = i as u16; ctrl_count += 1;
-            } else if m13.flags & FLAG_TUNNEL != 0 {
+            } else if flags & FLAG_TUNNEL != 0 {
                 // Sprint S2: Defer TUN write to after classify loop (keep hot classify cache-tight).
                 // Store rx_batch index + m13_offset (varies per encapsulation type).
                 tun_write_indices[tun_write_batch] = i as u16;
                 tun_write_offsets[tun_write_batch] = m13_offset as u16;
                 tun_write_batch += 1;
-            } else if m13.flags & FLAG_CONTROL != 0 {
+            } else if flags & FLAG_CONTROL != 0 {
                 // Sprint 5.21: Check for FIN/FIN-ACK
-                if m13.flags & FLAG_FIN != 0 {
+                if flags & FLAG_FIN != 0 {
                     if closing {
                         eprintln!("[M13-W{}] FIN-ACK received. Graceful close complete.", worker_idx);
                         slab.free((rx_batch[i].addr / FRAME_SIZE as u64) as u32);
                         fin_deadline_ns = 0;
                         continue;
                     } else {
-                        // FIN from peer — send FIN-ACK via raw UDP, then evict
+                        // FIN from peer — send FIN-ACK, then evict
                         if let Some(pidx) = cur_peer_idx {
                             eprintln!("[M13-W{}] FIN received from peer {:?}. Sending FIN-ACK.",
                                 worker_idx, peers.slots[pidx].addr);
-                            send_fin_burst_udp(
-                                &mut slab, &engine, &mut scheduler,
-                                &src_mac, &gateway_mac,
-                                hub_ip, peers.slots[pidx].addr.ip,
-                                hub_port, peers.slots[pidx].addr.port,
-                                &mut ip_id_counter,
-                                peers.slots[pidx].seq_tx, true, 3,
-                            );
+                            if peers.slots[pidx].addr.is_udp() {
+                                send_fin_burst_udp(
+                                    &mut slab, &engine, &mut scheduler,
+                                    &src_mac, &gateway_mac,
+                                    hub_ip, peers.slots[pidx].addr.ip().unwrap(),
+                                    hub_port, peers.slots[pidx].addr.port().unwrap(),
+                                    &mut ip_id_counter,
+                                    peers.slots[pidx].seq_tx, true, 3,
+                                );
+                            } else {
+                                send_fin_burst_l2(
+                                    &mut slab, &engine, &mut scheduler,
+                                    &src_mac, &peers.slots[pidx].mac,
+                                    peers.slots[pidx].seq_tx, true, 3,
+                                );
+                            }
                             peers.evict(pidx);
                         }
                         slab.free((rx_batch[i].addr / FRAME_SIZE as u64) as u32);
@@ -2761,11 +2914,9 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                     }
                 }
                 // Per-peer registration echo: only if peer has no AEAD session yet
-                if m13.flags & FLAG_HANDSHAKE == 0 && m13.flags & FLAG_FRAGMENT == 0 {
+                if flags & FLAG_HANDSHAKE == 0 && flags & FLAG_FRAGMENT == 0 {
                     if let Some(pidx) = cur_peer_idx {
                         if !peers.slots[pidx].has_session() {
-                            let peer_ip = peers.slots[pidx].addr.ip;
-                            let peer_port = peers.slots[pidx].addr.port;
                             let mut echo_m13 = [0u8; 62];
                             echo_m13[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
                             echo_m13[6..12].copy_from_slice(&src_mac);
@@ -2774,20 +2925,28 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                             echo_m13[14] = M13_WIRE_MAGIC;
                             echo_m13[15] = M13_WIRE_VERSION;
                             echo_m13[54] = FLAG_CONTROL;
-                            if let Some(idx) = slab.alloc() {
-                                let frame_ptr = unsafe { engine.umem_base().add((idx as usize) * FRAME_SIZE as usize) };
-                                let total_len = RAW_HDR_LEN + 62;
-                                unsafe {
-                                    let buf = std::slice::from_raw_parts_mut(frame_ptr, FRAME_SIZE as usize);
-                                    build_raw_udp_frame(
-                                        buf, &src_mac, &gateway_mac,
-                                        hub_ip, peer_ip, hub_port, peer_port,
-                                        ip_id_counter, &echo_m13,
-                                    );
-                                    ip_id_counter = ip_id_counter.wrapping_add(1);
+                            if peers.slots[pidx].addr.is_udp() {
+                                let peer_ip = peers.slots[pidx].addr.ip().unwrap();
+                                let peer_port = peers.slots[pidx].addr.port().unwrap();
+                                if let Some(idx) = slab.alloc() {
+                                    let frame_ptr = unsafe { engine.umem_base().add((idx as usize) * FRAME_SIZE as usize) };
+                                    let total_len = RAW_HDR_LEN + 62;
+                                    unsafe {
+                                        let buf = std::slice::from_raw_parts_mut(frame_ptr, FRAME_SIZE as usize);
+                                        build_raw_udp_frame(
+                                            buf, &src_mac, &gateway_mac,
+                                            hub_ip, peer_ip, hub_port, peer_port,
+                                            ip_id_counter, &echo_m13,
+                                        );
+                                        ip_id_counter = ip_id_counter.wrapping_add(1);
+                                    }
+                                    scheduler.enqueue_critical((idx as u64) * FRAME_SIZE as u64, total_len as u32);
+                                    udp_tx_count += 1;
                                 }
-                                scheduler.enqueue_critical((idx as u64) * FRAME_SIZE as u64, total_len as u32);
-                                udp_tx_count += 1;
+                            } else {
+                                if send_l2_frame(&mut slab, &engine, &mut scheduler, &peers.slots[pidx].mac, &echo_m13) {
+                                    udp_tx_count += 1;
+                                }
                             }
                         }
                     }

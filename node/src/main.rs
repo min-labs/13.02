@@ -146,7 +146,7 @@ fn rdtsc_ns(cal: &TscCal) -> u64 {
 // ============================================================================
 // NODE STATE FSM
 // ============================================================================
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug)]
 enum NodeState {
     Disconnected,
     Registering,
@@ -162,6 +162,7 @@ enum NodeState {
     /// Session established: AEAD active, session key derived
     Established {
         session_key: [u8; 32],       // AES-256-GCM key from HKDF-SHA-512
+        cipher: Box<aead::LessSafeKey>, // Cached AEAD cipher (no per-packet key expansion)
         frame_count: u64,            // Frames encrypted under this key
         established_ns: u64,         // When session was established
     },
@@ -273,7 +274,7 @@ impl Assembler {
 use ring::aead;
 
 /// Seal (encrypt+authenticate) an M13 frame in-place.
-fn seal_frame(frame: &mut [u8], key: &[u8; 32], seq: u64, direction: u8) {
+fn seal_frame(frame: &mut [u8], lsk: &aead::LessSafeKey, seq: u64, direction: u8) {
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes[0..8].copy_from_slice(&seq.to_le_bytes());
     nonce_bytes[8] = direction;
@@ -281,8 +282,6 @@ fn seal_frame(frame: &mut [u8], key: &[u8; 32], seq: u64, direction: u8) {
     frame[sig+2] = 0x01; frame[sig+3] = 0x00;
     frame[sig+20..sig+32].copy_from_slice(&nonce_bytes);
     let pt = sig + 32;
-    let ukey = aead::UnboundKey::new(&aead::AES_256_GCM, key).unwrap();
-    let lsk = aead::LessSafeKey::new(ukey);
     let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
     let aad_bytes: [u8; 4] = frame[sig..sig+4].try_into().unwrap();
     let aad = aead::Aad::from(aad_bytes);
@@ -291,7 +290,7 @@ fn seal_frame(frame: &mut [u8], key: &[u8; 32], seq: u64, direction: u8) {
 }
 
 /// Open (verify+decrypt) an M13 frame in-place. Returns true if authentic.
-fn open_frame(frame: &mut [u8], key: &[u8; 32], our_dir: u8) -> bool {
+fn open_frame(frame: &mut [u8], lsk: &aead::LessSafeKey, our_dir: u8) -> bool {
     let sig = ETH_HDR_SIZE;
     if frame.len() < sig + 32 + 8 { return false; }
     if frame[sig+2] != 0x01 { return false; }
@@ -301,8 +300,6 @@ fn open_frame(frame: &mut [u8], key: &[u8; 32], our_dir: u8) -> bool {
     let mut wire_tag_bytes = [0u8; 16];
     wire_tag_bytes.copy_from_slice(&frame[sig+4..sig+20]);
     let pt = sig + 32;
-    let ukey = aead::UnboundKey::new(&aead::AES_256_GCM, key).unwrap();
-    let lsk = aead::LessSafeKey::new(ukey);
     let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
     let aad_bytes: [u8; 4] = frame[sig..sig+4].try_into().unwrap();
     let aad = aead::Aad::from(&aad_bytes);
@@ -1066,17 +1063,19 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
                     let flags = m13.flags;
 
                     // Sprint 6.2: Mandatory encryption — reject cleartext data after session
+                    // Exempt: handshakes, fragments, and control frames (FIN/keepalive)
                     if matches!(state, NodeState::Established { .. })
                        && buf[ETH_HDR_SIZE + 2] != 0x01
-                       && flags & FLAG_HANDSHAKE == 0 && flags & FLAG_FRAGMENT == 0 {
+                       && flags & FLAG_HANDSHAKE == 0 && flags & FLAG_FRAGMENT == 0
+                       && flags & FLAG_CONTROL == 0 {
                         continue; // drop cleartext data frame
                     }
 
                     // Sprint 6.2: AEAD verification on encrypted frames
                     if buf[ETH_HDR_SIZE + 2] == 0x01 {
                         // Encrypted frame — must verify+decrypt
-                        if let NodeState::Established { ref session_key, ref mut frame_count, ref established_ns, .. } = state {
-                            if !open_frame(buf, session_key, DIR_NODE_TO_HUB) {
+                        if let NodeState::Established { ref cipher, ref mut frame_count, ref established_ns, .. } = state {
+                            if !open_frame(buf, cipher, DIR_NODE_TO_HUB) {
                                 aead_fail_count += 1;
                                 if aead_fail_count <= 3 {
                                     eprintln!("[M13-NODE-AEAD] FAIL #{} len={} nonce={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}:{:02x}{:02x}{:02x}{:02x}",
@@ -1142,6 +1141,9 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
                                         // Transition to Established with PQC-derived session key
                                         state = NodeState::Established {
                                             session_key,
+                                            cipher: Box::new(aead::LessSafeKey::new(
+                                                aead::UnboundKey::new(&aead::AES_256_GCM, &session_key).unwrap()
+                                            )),
                                             frame_count: 0,
                                             established_ns: now,
                                         };
@@ -1180,9 +1182,9 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
                         // Echo: swap MACs, re-stamp seq, encrypt, send back
                         if let Some(mut echo_frame) = build_echo_frame(buf, seq_tx) {
                             // Seal if session has non-zero key
-                            if let NodeState::Established { ref session_key, .. } = state {
+                            if let NodeState::Established { ref cipher, ref session_key, .. } = state {
                                 if *session_key != [0u8; 32] {
-                                    seal_frame(&mut echo_frame, session_key, seq_tx, DIR_NODE_TO_HUB);
+                                    seal_frame(&mut echo_frame, cipher, seq_tx, DIR_NODE_TO_HUB);
                                 }
                             }
                             seq_tx += 1;
@@ -1233,7 +1235,7 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
         // === Sprint S2: TUN drain batching (64/tick) + sendmmsg batch flush ===
         if let Some(ref mut tun_file) = tun {
             // Only forward if session established
-            if let NodeState::Established { ref session_key, .. } = state {
+            if let NodeState::Established { ref cipher, .. } = state {
                 // TX arrays pre-allocated outside loop — no per-tick memset.
                 let mut tx_count_batch: usize = 0;
 
@@ -1260,7 +1262,7 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
 
                             // Encrypt
                             let flen = 62 + n;
-                            seal_frame(&mut frame[..flen], session_key, seq_tx, DIR_NODE_TO_HUB);
+                            seal_frame(&mut frame[..flen], cipher, seq_tx, DIR_NODE_TO_HUB);
 
                             seq_tx += 1;
                             hexdump.dump_tx(&frame[..flen], now);
@@ -1368,7 +1370,7 @@ fn run_afxdp_worker(if_name: &str, echo: bool, hexdump_mode: bool, mut tun: Opti
 
         // === Sprint S2: TUN drain batching (64/tick) + batch commit/kick ===
         if let Some(ref mut tun_file) = tun {
-            if let NodeState::Established { ref session_key, .. } = state {
+            if let NodeState::Established { ref cipher, .. } = state {
                 let mut tun_staged = 0u32;
                 for _ in 0..64u32 {
                     // Sprint S2: Zero-copy TUN → UMEM. Speculatively alloc slab,
@@ -1399,7 +1401,7 @@ fn run_afxdp_worker(if_name: &str, echo: bool, hexdump_mode: bool, mut tun: Opti
                                 // Payload already in place — no copy needed.
                                 // Seal
                                 let frame_slice = std::slice::from_raw_parts_mut(buf, flen);
-                                seal_frame(frame_slice, session_key, seq_tx, DIR_NODE_TO_HUB);
+                                seal_frame(frame_slice, cipher, seq_tx, DIR_NODE_TO_HUB);
                                 hexdump.dump_tx(frame_slice, now);
                             }
                             engine.tx_path.stage_tx(idx, flen as u32);
@@ -1467,9 +1469,11 @@ fn run_afxdp_worker(if_name: &str, echo: bool, hexdump_mode: bool, mut tun: Opti
             let flags = m13.flags;
 
             // Sprint 6.2: Mandatory encryption — reject cleartext data after session
+            // Exempt: handshakes, fragments, and control frames (FIN/keepalive)
             if matches!(state, NodeState::Established { .. })
                && frame_slice[ETH_HDR_SIZE + 2] != 0x01
-               && flags & FLAG_HANDSHAKE == 0 && flags & FLAG_FRAGMENT == 0 {
+               && flags & FLAG_HANDSHAKE == 0 && flags & FLAG_FRAGMENT == 0
+               && flags & FLAG_CONTROL == 0 {
                 slab.free((desc.addr / FRAME_SIZE as u64) as u32);
                 continue; // drop cleartext data frame
             }
@@ -1477,8 +1481,8 @@ fn run_afxdp_worker(if_name: &str, echo: bool, hexdump_mode: bool, mut tun: Opti
             // Sprint 6.2: AEAD verification on encrypted frames
             if frame_slice[ETH_HDR_SIZE + 2] == 0x01 {
                 let frame_mut = unsafe { std::slice::from_raw_parts_mut(frame_ptr, frame_len) };
-                if let NodeState::Established { ref session_key, ref mut frame_count, ref established_ns, .. } = state {
-                    if !open_frame(frame_mut, session_key, DIR_NODE_TO_HUB) {
+                if let NodeState::Established { ref cipher, ref mut frame_count, ref established_ns, .. } = state {
+                    if !open_frame(frame_mut, cipher, DIR_NODE_TO_HUB) {
                         slab.free((desc.addr / FRAME_SIZE as u64) as u32);
                         continue;
                     }
@@ -1497,6 +1501,11 @@ fn run_afxdp_worker(if_name: &str, echo: bool, hexdump_mode: bool, mut tun: Opti
                     continue;
                 }
             }
+
+            // CRITICAL: Re-read flags from decrypted buffer (same fix as Node UDP worker).
+            // `m13.flags` reference was created BEFORE open_frame() decrypted the buffer.
+            // flags (offset +40) is in the encrypted region. Must re-read from actual memory.
+            let flags = unsafe { *frame_ptr.add(ETH_HDR_SIZE + 40) };
 
             if flags & FLAG_FRAGMENT != 0 {
                 if frame_len >= ETH_HDR_SIZE + M13_HDR_SIZE + FRAG_HDR_SIZE {
@@ -1545,6 +1554,9 @@ fn run_afxdp_worker(if_name: &str, echo: bool, hexdump_mode: bool, mut tun: Opti
                                     // Transition to Established with PQC-derived session key
                                     state = NodeState::Established {
                                         session_key,
+                                        cipher: Box::new(aead::LessSafeKey::new(
+                                            aead::UnboundKey::new(&aead::AES_256_GCM, &session_key).unwrap()
+                                        )),
                                         frame_count: 0,
                                         established_ns: now,
                                     };
@@ -1585,10 +1597,10 @@ fn run_afxdp_worker(if_name: &str, echo: bool, hexdump_mode: bool, mut tun: Opti
                     m13_mut.seq_id = seq_tx;
                 }
                 // Seal if session has non-zero key
-                if let NodeState::Established { ref session_key, .. } = state {
+                if let NodeState::Established { ref cipher, ref session_key, .. } = state {
                     if *session_key != [0u8; 32] {
                         let frame_mut = unsafe { std::slice::from_raw_parts_mut(frame_ptr, frame_len) };
-                        seal_frame(frame_mut, session_key, seq_tx, DIR_NODE_TO_HUB);
+                        seal_frame(frame_mut, cipher, seq_tx, DIR_NODE_TO_HUB);
                     }
                 }
                 seq_tx += 1;
