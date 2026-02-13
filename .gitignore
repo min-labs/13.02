@@ -1,0 +1,20 @@
+# Build artifacts
+/target/
+/hub/target/
+/node/target/
+
+# Generated build artifacts (written to source tree by build.rs)
+m13_math_core.cpp
+m13_math_sim
+m13_silicon.tcl
+hub/m13_math_core.cpp
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

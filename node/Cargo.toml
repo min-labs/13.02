@@ -1,0 +1,19 @@
+[package]
+name = "m13-node"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+libbpf-sys = "0.6.0-1"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Sprint 6.2: PQC cold-path dependencies (handshake only — NEVER in hot loop)
+ml-kem = "0.2"           # FIPS 203 ML-KEM-1024 key encapsulation
+ml-dsa = "0.0.4"         # FIPS 204 ML-DSA-87 digital signatures
+sha2 = "0.10"            # SHA-512 for HKDF + transcript hashing
+hkdf = "0.12"            # HKDF-SHA-512 session key derivation
+rand = "0.8"             # OsRng CSPRNG (getrandom(2) → kernel ChaCha20 → K26 TRNG)
+
+[build-dependencies]
+bindgen = "0.69"

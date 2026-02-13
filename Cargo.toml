@@ -1,0 +1,11 @@
+[workspace]
+members = ["hub", "node"]
+resolver = "2"
+
+# Sprint 5.11: Deterministic Error Handling
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
