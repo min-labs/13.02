@@ -2446,27 +2446,41 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
         // Stage -1 REMOVED: All RX is now pure AF_XDP (Stage 1 classify).
         // No kernel socket recv_from. Eliminates dual-receiver contention on UDP/443.
 
-        // === SPRINT S1: TUN TX — Batch drain 64/tick + per-peer routing ===
+        // === SPRINT S2: TUN TX — Zero-copy drain 64/tick + per-peer routing ===
         // Only worker 0 reads TUN to avoid contention/reordering.
-        // Drain up to 64 packets per tick (TUN symmetry with AF_XDP batch size).
+        // Speculative slab alloc → read TUN directly into UMEM → route → encapsulate.
+        // No intermediate tun_buf — BoringTun/Cloudflare pattern.
         if worker_idx == 0 {
             if let Some(ref mut tun_file) = tun {
                 for _tun_batch in 0..64u32 {
-                    let mut tun_buf = [0u8; 1500];
-                    match tun_file.read(&mut tun_buf) {
+                    // Speculative slab alloc — read directly into UMEM payload region
+                    let idx = match slab.alloc() {
+                        Some(i) => i,
+                        None => break, // slab exhausted
+                    };
+                    let frame_ptr = unsafe { engine.umem_base().add((idx as usize) * FRAME_SIZE as usize) };
+                    // TUN payload goes at M13 offset 62 (ETH_HDR_SIZE + M13_HDR_SIZE)
+                    let payload_offset = ETH_HDR_SIZE + M13_HDR_SIZE; // 62
+                    let tun_slice = unsafe { std::slice::from_raw_parts_mut(frame_ptr.add(payload_offset), 1500) };
+                    match tun_file.read(tun_slice) {
                         Ok(n) if n > 0 => {
-                            // Route by destination IP in the TUN packet.
+                            // Route by destination IP in the TUN packet (already in UMEM).
                             // IPv4: dst_ip at offset 16..20 in the IP header.
-                            if n < 20 { continue; } // too short for IP header
-                            let dst_ip = [tun_buf[16], tun_buf[17], tun_buf[18], tun_buf[19]];
+                            if n < 20 {
+                                slab.free(idx);
+                                continue; // too short for IP header
+                            }
+                            // Read dst_ip from UMEM (already there — zero extra copy)
+                            let dst_ip = unsafe {
+                                [*tun_slice.get_unchecked(16), *tun_slice.get_unchecked(17),
+                                 *tun_slice.get_unchecked(18), *tun_slice.get_unchecked(19)]
+                            };
 
                             // Find the peer that owns this tunnel IP.
                             let peer_idx = match peers.lookup_by_tunnel_ip(dst_ip) {
                                 Some(idx) => idx,
                                 None => {
                                     // Fallback: if only 1 established peer, send to them.
-                                    // This handles the common single-peer case and legacy
-                                    // TUN configs that haven't assigned tunnel IPs yet.
                                     let mut fallback_idx: Option<usize> = None;
                                     let mut established_count = 0u16;
                                     for pi in 0..MAX_PEERS {
@@ -2478,78 +2492,86 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                                     if established_count == 1 {
                                         fallback_idx.unwrap()
                                     } else {
-                                        continue; // No established peer or ambiguous — drop
+                                        slab.free(idx);
+                                        continue; // No peer or ambiguous — drop
                                     }
                                 }
                             };
 
                             let peer_slot = &mut peers.slots[peer_idx];
-                            if !peer_slot.has_session() { continue; }
+                            if !peer_slot.has_session() {
+                                slab.free(idx);
+                                continue;
+                            }
 
                             let peer_ip = peer_slot.addr.ip;
                             let peer_port = peer_slot.addr.port;
                             let m13_flen = ETH_HDR_SIZE + M13_HDR_SIZE + n;
-                            if let Some(idx) = slab.alloc() {
-                                let frame_ptr = unsafe { engine.umem_base().add((idx as usize) * FRAME_SIZE as usize) };
-                                unsafe {
-                                    let m13_buf = std::slice::from_raw_parts_mut(frame_ptr, FRAME_SIZE as usize);
-                                    // Build M13 header
-                                    m13_buf[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-                                    m13_buf[6..12].copy_from_slice(&src_mac);
-                                    m13_buf[12] = (ETH_P_M13 >> 8) as u8;
-                                    m13_buf[13] = (ETH_P_M13 & 0xFF) as u8;
-                                    m13_buf[14] = M13_WIRE_MAGIC;
-                                    m13_buf[15] = M13_WIRE_VERSION;
-                                    let udp_seq = peer_slot.next_seq();
-                                    m13_buf[46..54].copy_from_slice(&udp_seq.to_le_bytes());
-                                    m13_buf[54] = FLAG_TUNNEL;
-                                    m13_buf[55..59].copy_from_slice(&(n as u32).to_le_bytes());
-                                    m13_buf[62..62 + n].copy_from_slice(&tun_buf[..n]);
-                                    seal_frame(&mut m13_buf[..m13_flen], &peer_slot.session_key, udp_seq, DIR_HUB_TO_NODE, ETH_HDR_SIZE);
+                            unsafe {
+                                let m13_buf = std::slice::from_raw_parts_mut(frame_ptr, FRAME_SIZE as usize);
+                                // Build M13 header (payload already in place at offset 62)
+                                m13_buf[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+                                m13_buf[6..12].copy_from_slice(&src_mac);
+                                m13_buf[12] = (ETH_P_M13 >> 8) as u8;
+                                m13_buf[13] = (ETH_P_M13 & 0xFF) as u8;
+                                m13_buf[14] = M13_WIRE_MAGIC;
+                                m13_buf[15] = M13_WIRE_VERSION;
+                                // Zero signature region [16..46] — CRITICAL: must match Node's
+                                // expectation. Without this, stale UMEM data causes AEAD mismatch.
+                                m13_buf[16..46].fill(0);
+                                let udp_seq = peer_slot.next_seq();
+                                m13_buf[46..54].copy_from_slice(&udp_seq.to_le_bytes());
+                                m13_buf[54] = FLAG_TUNNEL;
+                                m13_buf[55..59].copy_from_slice(&(n as u32).to_le_bytes());
+                                // Zero padding [59..62]
+                                m13_buf[59..62].fill(0);
+                                // Payload already at [62..62+n] — no copy needed
+                                seal_frame(&mut m13_buf[..m13_flen], &peer_slot.session_key, udp_seq, DIR_HUB_TO_NODE, ETH_HDR_SIZE);
 
-                                    let total_len = RAW_HDR_LEN + m13_flen;
-                                    if total_len <= FRAME_SIZE as usize {
-                                        std::ptr::copy(frame_ptr, frame_ptr.add(RAW_HDR_LEN), m13_flen);
-                                        let raw_frame = std::slice::from_raw_parts_mut(frame_ptr, total_len);
-                                        // ETH header
-                                        raw_frame[0..6].copy_from_slice(&gateway_mac);
-                                        raw_frame[6..12].copy_from_slice(&src_mac);
-                                        raw_frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
-                                        // IP header
-                                        let ip_total = (IP_HDR_LEN + UDP_HDR_LEN + m13_flen) as u16;
-                                        let ip = &mut raw_frame[14..34];
-                                        ip[0] = 0x45; ip[1] = 0x00;
-                                        ip[2..4].copy_from_slice(&ip_total.to_be_bytes());
-                                        ip[4..6].copy_from_slice(&ip_id_counter.to_be_bytes());
-                                        ip_id_counter = ip_id_counter.wrapping_add(1);
-                                        ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
-                                        ip[8] = 64; ip[9] = 17;
-                                        ip[10..12].copy_from_slice(&[0, 0]);
-                                        ip[12..16].copy_from_slice(&hub_ip);
-                                        ip[16..20].copy_from_slice(&peer_ip);
-                                        let cksum = ip_checksum(ip);
-                                        ip[10..12].copy_from_slice(&cksum.to_be_bytes());
-                                        // UDP header
-                                        let udp_total = (UDP_HDR_LEN + m13_flen) as u16;
-                                        raw_frame[34..36].copy_from_slice(&hub_port.to_be_bytes());
-                                        raw_frame[36..38].copy_from_slice(&peer_port.to_be_bytes());
-                                        raw_frame[38..40].copy_from_slice(&udp_total.to_be_bytes());
-                                        raw_frame[40..42].copy_from_slice(&[0, 0]);
+                                let total_len = RAW_HDR_LEN + m13_flen;
+                                if total_len <= FRAME_SIZE as usize {
+                                    std::ptr::copy(frame_ptr, frame_ptr.add(RAW_HDR_LEN), m13_flen);
+                                    let raw_frame = std::slice::from_raw_parts_mut(frame_ptr, total_len);
+                                    // ETH header
+                                    raw_frame[0..6].copy_from_slice(&gateway_mac);
+                                    raw_frame[6..12].copy_from_slice(&src_mac);
+                                    raw_frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+                                    // IP header
+                                    let ip_total = (IP_HDR_LEN + UDP_HDR_LEN + m13_flen) as u16;
+                                    let ip = &mut raw_frame[14..34];
+                                    ip[0] = 0x45; ip[1] = 0x00;
+                                    ip[2..4].copy_from_slice(&ip_total.to_be_bytes());
+                                    ip[4..6].copy_from_slice(&ip_id_counter.to_be_bytes());
+                                    ip_id_counter = ip_id_counter.wrapping_add(1);
+                                    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+                                    ip[8] = 64; ip[9] = 17;
+                                    ip[10..12].copy_from_slice(&[0, 0]);
+                                    ip[12..16].copy_from_slice(&hub_ip);
+                                    ip[16..20].copy_from_slice(&peer_ip);
+                                    let cksum = ip_checksum(ip);
+                                    ip[10..12].copy_from_slice(&cksum.to_be_bytes());
+                                    // UDP header
+                                    let udp_total = (UDP_HDR_LEN + m13_flen) as u16;
+                                    raw_frame[34..36].copy_from_slice(&hub_port.to_be_bytes());
+                                    raw_frame[36..38].copy_from_slice(&peer_port.to_be_bytes());
+                                    raw_frame[38..40].copy_from_slice(&udp_total.to_be_bytes());
+                                    raw_frame[40..42].copy_from_slice(&[0, 0]);
 
-                                        hexdump.dump_tx(raw_frame.as_ptr(), total_len, now);
-                                        scheduler.enqueue_bulk((idx as u64) * FRAME_SIZE as u64, total_len as u32);
-                                        udp_tx_count += 1;
-                                        tun_read_count += 1;
-                                        stats.tx_count.value.fetch_add(1, Ordering::Relaxed);
-                                    } else {
-                                        slab.free(idx);
-                                    }
+                                    hexdump.dump_tx(raw_frame.as_ptr(), total_len, now);
+                                    scheduler.enqueue_bulk((idx as u64) * FRAME_SIZE as u64, total_len as u32);
+                                    udp_tx_count += 1;
+                                    tun_read_count += 1;
+                                    stats.tx_count.value.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    slab.free(idx);
                                 }
                             }
                         }
-                        Ok(_) => break,
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
+                        _ => {
+                            // WouldBlock or EOF — free speculative slab, drain complete
+                            slab.free(idx);
+                            break;
+                        }
                     }
                 }
             }
@@ -2598,6 +2620,10 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
         // Data (TC_BULK) | Feedback → BBR | TC_CRITICAL → Jitter Buffer
         let rx_batch_ns = if rx_count > 0 { now } else { 0 };
         let (mut data_count, mut ctrl_count, crit_count) = (0usize, 0usize, 0usize);
+        // Sprint S2: Deferred TUN write batch — collect during classify, flush after.
+        let mut tun_write_indices: [u16; GRAPH_BATCH] = [0; GRAPH_BATCH];
+        let mut tun_write_offsets: [u16; GRAPH_BATCH] = [0; GRAPH_BATCH]; // m13_offset per frame
+        let mut tun_write_batch: usize = 0;
         for i in 0..rx_count {
             if i + PREFETCH_DIST < rx_count {
                 unsafe { prefetch_read_l1(umem.add(rx_batch[i + PREFETCH_DIST].addr as usize + ETH_HDR_SIZE)); }
@@ -2841,19 +2867,11 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
             if m13.flags & FLAG_FEEDBACK != 0 {
                 ctrl_indices[ctrl_count] = i as u16; ctrl_count += 1;
             } else if m13.flags & FLAG_TUNNEL != 0 {
-                // Tunnel frame: decrypt already verified by AEAD gate above.
-                if let Some(ref mut tun_file) = tun {
-                    let frame_ptr = unsafe { umem.add(rx_batch[i].addr as usize) };
-                    let plen = m13.payload_len as usize;
-                    let start = m13_offset + M13_HDR_SIZE;
-                    let frame_len = rx_batch[i].len as usize;
-                    if start + plen <= frame_len {
-                         let payload = unsafe { std::slice::from_raw_parts(frame_ptr.add(start), plen) };
-                         let _ = tun_file.write(payload);
-                         tun_write_count += 1;
-                    }
-                }
-                slab.free((rx_batch[i].addr / FRAME_SIZE as u64) as u32);
+                // Sprint S2: Defer TUN write to after classify loop (keep hot classify cache-tight).
+                // Store rx_batch index + m13_offset (varies per encapsulation type).
+                tun_write_indices[tun_write_batch] = i as u16;
+                tun_write_offsets[tun_write_batch] = m13_offset as u16;
+                tun_write_batch += 1;
             } else if m13.flags & FLAG_CONTROL != 0 {
                 // Sprint 5.21: Check for FIN/FIN-ACK
                 if m13.flags & FLAG_FIN != 0 {
@@ -2920,6 +2938,34 @@ fn worker_entry(worker_idx: usize, core_id: usize, queue_id: i32, if_name: &str,
                 rx_state.delivered += 1;
                 rx_state.last_rx_batch_ns = rx_batch_ns;
                 rx_bitmap.mark(m13.seq_id);
+            }
+        }
+        // === SPRINT S2: DEFERRED TUN WRITE BATCH ===
+        // All tunnel frames collected during classify are written + freed here.
+        // Keeps the hot classify loop free of TUN write() syscalls.
+        if tun_write_batch > 0 {
+            if let Some(ref mut tun_file) = tun {
+                for ti in 0..tun_write_batch {
+                    let idx = tun_write_indices[ti] as usize;
+                    let m13_off = tun_write_offsets[ti] as usize;
+                    let frame_ptr = unsafe { umem.add(rx_batch[idx].addr as usize) };
+                    let frame_len = rx_batch[idx].len as usize;
+                    let m13 = unsafe { &*(frame_ptr.add(m13_off) as *const M13Header) };
+                    let plen = m13.payload_len as usize;
+                    let start = m13_off + M13_HDR_SIZE;
+                    if start + plen <= frame_len {
+                        let payload = unsafe { std::slice::from_raw_parts(frame_ptr.add(start), plen) };
+                        let _ = tun_file.write(payload);
+                        tun_write_count += 1;
+                    }
+                    slab.free((rx_batch[idx].addr / FRAME_SIZE as u64) as u32);
+                }
+            } else {
+                // No TUN — just free the slab slots
+                for ti in 0..tun_write_batch {
+                    let idx = tun_write_indices[ti] as usize;
+                    slab.free((rx_batch[idx].addr / FRAME_SIZE as u64) as u32);
+                }
             }
         }
 

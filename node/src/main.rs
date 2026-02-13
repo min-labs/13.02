@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use std::net::UdpSocket;
+use std::os::unix::io::AsRawFd;
 
 // Sprint 6.2: PQC cold-path imports (handshake only — never in hot loop)
 use sha2::{Sha512, Digest};
@@ -1111,12 +1112,17 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
         .unwrap_or_else(|_| fatal(0x30, "UDP bind failed"));
     sock.connect(hub_addr)
         .unwrap_or_else(|_| fatal(0x31, "UDP connect failed"));
-    sock.set_read_timeout(Some(Duration::from_millis(1))).ok();
+    // Sprint S2: O_NONBLOCK for recvmmsg busy-drain (replaces 1ms read_timeout)
+    // Preserve existing flags (F_GETFL) then OR in O_NONBLOCK — never clobber.
+    let raw_fd = sock.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+        libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
 
     // Extract Hub IP (without port) for routing
     let hub_ip = hub_addr.split(':').next().unwrap_or(hub_addr).to_string();
 
-    let mut buf = [0u8; 2048];
     let mut seq_tx: u64 = 0;
     let mut rx_count: u64 = 0;
     let mut tx_count: u64 = 0;
@@ -1143,6 +1149,27 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
     hexdump.dump_tx(&reg, rdtsc_ns(&cal));
     let mut state = NodeState::Registering;
 
+    // === Sprint S2: Pre-allocate RX batch arrays OUTSIDE hot loop ===
+    // 128KB rx_bufs + iovecs + mmsghdr — init once, not per-tick (cache thrashing prevention)
+    const RX_BATCH: usize = 64;
+    let mut rx_bufs: [[u8; 2048]; RX_BATCH] = [[0u8; 2048]; RX_BATCH];
+    let mut rx_iovecs: [libc::iovec; RX_BATCH] = unsafe { std::mem::zeroed() };
+    let mut rx_msgs: [libc::mmsghdr; RX_BATCH] = unsafe { std::mem::zeroed() };
+    for i in 0..RX_BATCH {
+        rx_iovecs[i].iov_base = rx_bufs[i].as_mut_ptr() as *mut libc::c_void;
+        rx_iovecs[i].iov_len = 2048;
+        rx_msgs[i].msg_hdr.msg_iov = &mut rx_iovecs[i] as *mut libc::iovec;
+        rx_msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    // === Sprint S2: Pre-allocate TX batch arrays OUTSIDE hot loop ===
+    // 100KB tx_bufs + iovecs + mmsghdr — init once (sendmmsg batch flush buffers)
+    const TUN_BATCH: usize = 64;
+    let mut tx_bufs: [[u8; 1600]; TUN_BATCH] = [[0u8; 1600]; TUN_BATCH];
+    let mut tx_lens: [usize; TUN_BATCH] = [0; TUN_BATCH];
+    let mut tx_iovecs: [libc::iovec; TUN_BATCH] = unsafe { std::mem::zeroed() };
+    let mut tx_msgs: [libc::mmsghdr; TUN_BATCH] = unsafe { std::mem::zeroed() };
+
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) { break; }
         let now = rdtsc_ns(&cal);
@@ -1155,163 +1182,160 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
             }
         }
 
-        // === RX ===
-        match sock.recv(&mut buf) {
-            Ok(len) => {
-                rx_count += 1;
+        // === Sprint S2: RX — recvmmsg(64) batch drain ===
+        // Arrays pre-allocated outside loop — no per-tick memset (cache-friendly).
+        let rx_n = unsafe {
+            libc::recvmmsg(raw_fd, rx_msgs.as_mut_ptr(), RX_BATCH as u32,
+                           libc::MSG_DONTWAIT, std::ptr::null_mut())
+        };
+        let rx_batch_count = if rx_n > 0 { rx_n as usize } else { 0 };
+        for rx_i in 0..rx_batch_count {
+            let len = rx_msgs[rx_i].msg_len as usize;
+            let buf = &mut rx_bufs[rx_i][..len];
+            rx_count += 1;
 
-                hexdump.dump_rx(&buf[..len], now);
+            hexdump.dump_rx(buf, now);
 
-                if len >= ETH_HDR_SIZE + M13_HDR_SIZE {
-                    let m13 = unsafe { &*(buf.as_ptr().add(ETH_HDR_SIZE) as *const M13Header) };
-                    if m13.signature[0] == M13_WIRE_MAGIC && m13.signature[1] == M13_WIRE_VERSION {
-                        // Sprint 6.3: State-driven transition
-                        // Registering → initiate PQC handshake on first valid Hub frame
-                        if matches!(state, NodeState::Registering) {
-                            state = initiate_handshake(
-                                &sock, &src_mac, &hub_mac, &mut seq_tx, &mut hexdump, &cal,
-                            );
-                            eprintln!("[M13-NODE-UDP] → Handshaking (PQC ClientHello sent)");
-                        }
-                        let flags = m13.flags;
+            if len >= ETH_HDR_SIZE + M13_HDR_SIZE {
+                let m13 = unsafe { &*(buf.as_ptr().add(ETH_HDR_SIZE) as *const M13Header) };
+                if m13.signature[0] == M13_WIRE_MAGIC && m13.signature[1] == M13_WIRE_VERSION {
+                    // Sprint 6.3: State-driven transition
+                    // Registering → initiate PQC handshake on first valid Hub frame
+                    if matches!(state, NodeState::Registering) {
+                        state = initiate_handshake(
+                            &sock, &src_mac, &hub_mac, &mut seq_tx, &mut hexdump, &cal,
+                        );
+                        eprintln!("[M13-NODE-UDP] → Handshaking (PQC ClientHello sent)");
+                    }
+                    let flags = m13.flags;
 
-                        // Sprint 6.2: Mandatory encryption — reject cleartext data after session
-                        if matches!(state, NodeState::Established { .. })
-                           && buf[ETH_HDR_SIZE + 2] != 0x01
-                           && flags & FLAG_HANDSHAKE == 0 && flags & FLAG_FRAGMENT == 0 {
-                            continue; // drop cleartext data frame
-                        }
+                    // Sprint 6.2: Mandatory encryption — reject cleartext data after session
+                    if matches!(state, NodeState::Established { .. })
+                       && buf[ETH_HDR_SIZE + 2] != 0x01
+                       && flags & FLAG_HANDSHAKE == 0 && flags & FLAG_FRAGMENT == 0 {
+                        continue; // drop cleartext data frame
+                    }
 
-                        // Sprint 6.2: AEAD verification on encrypted frames
-                        if buf[ETH_HDR_SIZE + 2] == 0x01 {
-                            // Encrypted frame — must verify+decrypt
-                            if let NodeState::Established { ref session_key, ref mut frame_count, ref established_ns, .. } = state {
-                                if !open_frame(&mut buf[..len], session_key, DIR_NODE_TO_HUB) {
-                                    aead_fail_count += 1;
-                                    if aead_fail_count <= 3 {
-                                        eprintln!("[M13-NODE-AEAD] FAIL #{} len={} nonce={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}:{:02x}{:02x}{:02x}{:02x}",
-                                            aead_fail_count, len,
-                                            buf[ETH_HDR_SIZE+20], buf[ETH_HDR_SIZE+21], buf[ETH_HDR_SIZE+22], buf[ETH_HDR_SIZE+23],
-                                            buf[ETH_HDR_SIZE+24], buf[ETH_HDR_SIZE+25], buf[ETH_HDR_SIZE+26], buf[ETH_HDR_SIZE+27],
-                                            buf[ETH_HDR_SIZE+28], buf[ETH_HDR_SIZE+29], buf[ETH_HDR_SIZE+30], buf[ETH_HDR_SIZE+31]);
-                                    }
-                                    continue; // drop
+                    // Sprint 6.2: AEAD verification on encrypted frames
+                    if buf[ETH_HDR_SIZE + 2] == 0x01 {
+                        // Encrypted frame — must verify+decrypt
+                        if let NodeState::Established { ref session_key, ref mut frame_count, ref established_ns, .. } = state {
+                            if !open_frame(buf, session_key, DIR_NODE_TO_HUB) {
+                                aead_fail_count += 1;
+                                if aead_fail_count <= 3 {
+                                    eprintln!("[M13-NODE-AEAD] FAIL #{} len={} nonce={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}:{:02x}{:02x}{:02x}{:02x}",
+                                        aead_fail_count, len,
+                                        buf[ETH_HDR_SIZE+20], buf[ETH_HDR_SIZE+21], buf[ETH_HDR_SIZE+22], buf[ETH_HDR_SIZE+23],
+                                        buf[ETH_HDR_SIZE+24], buf[ETH_HDR_SIZE+25], buf[ETH_HDR_SIZE+26], buf[ETH_HDR_SIZE+27],
+                                        buf[ETH_HDR_SIZE+28], buf[ETH_HDR_SIZE+29], buf[ETH_HDR_SIZE+30], buf[ETH_HDR_SIZE+31]);
                                 }
-                                // anti-replay removed for MVP
-                                *frame_count += 1;
-
-                                // Sprint 6.2: Rekey check — frame count or time limit
-                                if *frame_count >= REKEY_FRAME_LIMIT
-                                   || now.saturating_sub(*established_ns) > REKEY_TIME_LIMIT_NS {
-                                    eprintln!("[M13-NODE-PQC] Rekey threshold reached. Re-initiating handshake.");
-                                    state = NodeState::Registering;
-                                    continue;
-                                }
-                            } else {
-                                continue; // encrypted frame but no session — drop
+                                continue; // drop
                             }
+                            // anti-replay removed for MVP
+                            *frame_count += 1;
+
+                            // Sprint 6.2: Rekey check — frame count or time limit
+                            if *frame_count >= REKEY_FRAME_LIMIT
+                               || now.saturating_sub(*established_ns) > REKEY_TIME_LIMIT_NS {
+                                eprintln!("[M13-NODE-PQC] Rekey threshold reached. Re-initiating handshake.");
+                                state = NodeState::Registering;
+                                continue;
+                            }
+                        } else {
+                            continue; // encrypted frame but no session — drop
                         }
+                    }
 
-                        // CRITICAL: Re-read flags from decrypted buffer.
-                        // The `flags` variable at line 1077 was read BEFORE open_frame()
-                        // decrypted the buffer. Since flags (byte 54) is in the encrypted
-                        // region (bytes 46+), the original copy holds ciphertext garbage.
-                        // All flag-based routing below (TUNNEL, CONTROL, FRAGMENT, echo)
-                        // MUST use the decrypted value.
-                        let flags = buf[ETH_HDR_SIZE + 40];
+                    // CRITICAL: Re-read flags from decrypted buffer.
+                    // The `flags` variable above was read BEFORE open_frame()
+                    // decrypted the buffer. Since flags (byte 54) is in the encrypted
+                    // region (bytes 46+), the original copy holds ciphertext garbage.
+                    // All flag-based routing below (TUNNEL, CONTROL, FRAGMENT, echo)
+                    // MUST use the decrypted value.
+                    let flags = buf[ETH_HDR_SIZE + 40];
 
-                        // Fragment handling
-                        if flags & FLAG_FRAGMENT != 0 && len >= ETH_HDR_SIZE + M13_HDR_SIZE + FRAG_HDR_SIZE {
-                            let frag_hdr = unsafe { &*(buf.as_ptr().add(ETH_HDR_SIZE + M13_HDR_SIZE) as *const FragHeader) };
-                            let frag_msg_id = unsafe { std::ptr::addr_of!((*frag_hdr).frag_msg_id).read_unaligned() };
-                            let frag_index = unsafe { std::ptr::addr_of!((*frag_hdr).frag_index).read_unaligned() };
-                            let frag_total = unsafe { std::ptr::addr_of!((*frag_hdr).frag_total).read_unaligned() };
-                            let frag_offset = unsafe { std::ptr::addr_of!((*frag_hdr).frag_offset).read_unaligned() };
-                            let frag_data_len = unsafe { std::ptr::addr_of!((*frag_hdr).frag_len).read_unaligned() } as usize;
-                            let frag_start = ETH_HDR_SIZE + M13_HDR_SIZE + FRAG_HDR_SIZE;
-                            if frag_start + frag_data_len <= len {
-                                if let Some(reassembled) = assembler.feed(
-                                    frag_msg_id, frag_index, frag_total, frag_offset,
-                                    &buf[frag_start..frag_start + frag_data_len], now,
-                                ) {
-                                    // Sprint 6.3: Route handshake messages to PQC processor
-                                    if flags & FLAG_HANDSHAKE != 0 {
-                                        eprintln!("[M13-NODE-UDP] Reassembled handshake msg_id={} len={}",
-                                            frag_msg_id, reassembled.len());
-                                        if let Some((session_key, finished_payload)) = process_handshake_node(&reassembled, &state) {
-                                            // Send Finished (Msg 3)
-                                            let hs_flags = FLAG_CONTROL | FLAG_HANDSHAKE;
-                                            let frags = send_fragmented_udp(
-                                                &sock, &src_mac, &hub_mac,
-                                                &finished_payload, hs_flags,
-                                                &mut seq_tx, &mut hexdump, &cal,
-                                            );
-                                            eprintln!("[M13-NODE-PQC] Finished sent: {}B, {} fragments",
-                                                finished_payload.len(), frags);
+                    // Fragment handling
+                    if flags & FLAG_FRAGMENT != 0 && len >= ETH_HDR_SIZE + M13_HDR_SIZE + FRAG_HDR_SIZE {
+                        let frag_hdr = unsafe { &*(buf.as_ptr().add(ETH_HDR_SIZE + M13_HDR_SIZE) as *const FragHeader) };
+                        let frag_msg_id = unsafe { std::ptr::addr_of!((*frag_hdr).frag_msg_id).read_unaligned() };
+                        let frag_index = unsafe { std::ptr::addr_of!((*frag_hdr).frag_index).read_unaligned() };
+                        let frag_total = unsafe { std::ptr::addr_of!((*frag_hdr).frag_total).read_unaligned() };
+                        let frag_offset = unsafe { std::ptr::addr_of!((*frag_hdr).frag_offset).read_unaligned() };
+                        let frag_data_len = unsafe { std::ptr::addr_of!((*frag_hdr).frag_len).read_unaligned() } as usize;
+                        let frag_start = ETH_HDR_SIZE + M13_HDR_SIZE + FRAG_HDR_SIZE;
+                        if frag_start + frag_data_len <= len {
+                            if let Some(reassembled) = assembler.feed(
+                                frag_msg_id, frag_index, frag_total, frag_offset,
+                                &buf[frag_start..frag_start + frag_data_len], now,
+                            ) {
+                                // Sprint 6.3: Route handshake messages to PQC processor
+                                if flags & FLAG_HANDSHAKE != 0 {
+                                    eprintln!("[M13-NODE-UDP] Reassembled handshake msg_id={} len={}",
+                                        frag_msg_id, reassembled.len());
+                                    if let Some((session_key, finished_payload)) = process_handshake_node(&reassembled, &state) {
+                                        // Send Finished (Msg 3)
+                                        let hs_flags = FLAG_CONTROL | FLAG_HANDSHAKE;
+                                        let frags = send_fragmented_udp(
+                                            &sock, &src_mac, &hub_mac,
+                                            &finished_payload, hs_flags,
+                                            &mut seq_tx, &mut hexdump, &cal,
+                                        );
+                                        eprintln!("[M13-NODE-PQC] Finished sent: {}B, {} fragments",
+                                            finished_payload.len(), frags);
 
-                                            // Transition to Established with PQC-derived session key
-                                            state = NodeState::Established {
-                                                session_key,
-                                                frame_count: 0,
-                                                established_ns: now,
-                                            };
+                                        // Transition to Established with PQC-derived session key
+                                        state = NodeState::Established {
+                                            session_key,
+                                            frame_count: 0,
+                                            established_ns: now,
+                                        };
         
-                                            eprintln!("[M13-NODE-PQC] → Established (session key derived, AEAD active)");
+                                        eprintln!("[M13-NODE-PQC] → Established (session key derived, AEAD active)");
 
-                                            // Automatically set up VPN routing if tunnel is active
-                                            if tun.is_some() && !routes_installed {
-                                                setup_tunnel_routes(&hub_ip);
-                                                routes_installed = true;
-                                            }
-                                        } else {
-                                            eprintln!("[M13-NODE-PQC] Handshake processing failed → Disconnected");
-                                            state = NodeState::Disconnected;
+                                        // Automatically set up VPN routing if tunnel is active
+                                        if tun.is_some() && !routes_installed {
+                                            setup_tunnel_routes(&hub_ip);
+                                            routes_installed = true;
                                         }
                                     } else {
-                                        eprintln!("[M13-NODE-UDP] Reassembled data msg_id={} len={}",
-                                            frag_msg_id, reassembled.len());
+                                        eprintln!("[M13-NODE-PQC] Handshake processing failed → Disconnected");
+                                        state = NodeState::Disconnected;
                                     }
+                                } else {
+                                    eprintln!("[M13-NODE-UDP] Reassembled data msg_id={} len={}",
+                                        frag_msg_id, reassembled.len());
                                 }
                             }
-                        } else if flags & FLAG_CONTROL != 0 {
-                            // Control frame — handled
-                        } else if flags & FLAG_TUNNEL != 0 {
-                            // Tunnel frame: payload is IP packet
-                            // Decryption already verified by AEAD gate above
-                            if let Some(ref mut tun_file) = tun {
-                                let start = ETH_HDR_SIZE + M13_HDR_SIZE;
-                                let plen_bytes = &buf[55..59];
-                                let plen = u32::from_le_bytes(plen_bytes.try_into().unwrap()) as usize;
-                                // Payload starts at offset 62 (after padding), but let's check M13 header definition.
-                                // M13 header is 48 bytes. ETH is 14. Total 62.
-                                // Payload starts at 62. Protocol says M13 header + padding = 62 bytes total aligned?
-                                // datapath.rs: M13Header is 48 bytes.
-                                // 14 (ETH) + 48 (M13) = 62 bytes.
-                                // Payload follows immediately.
-                                if start + plen <= len {
-                                    let _ = tun_file.write(&buf[start..start+plen]);
+                        }
+                    } else if flags & FLAG_CONTROL != 0 {
+                        // Control frame — handled
+                    } else if flags & FLAG_TUNNEL != 0 {
+                        // Tunnel frame: payload is IP packet
+                        // Decryption already verified by AEAD gate above
+                        if let Some(ref mut tun_file) = tun {
+                            let start = ETH_HDR_SIZE + M13_HDR_SIZE;
+                            let plen_bytes = &buf[55..59];
+                            let plen = u32::from_le_bytes(plen_bytes.try_into().unwrap()) as usize;
+                            if start + plen <= len {
+                                let _ = tun_file.write(&buf[start..start+plen]);
+                            }
+                        }
+                    } else if echo && matches!(state, NodeState::Established { .. }) {
+                        // Echo: swap MACs, re-stamp seq, encrypt, send back
+                        if let Some(mut echo_frame) = build_echo_frame(buf, seq_tx) {
+                            // Seal if session has non-zero key
+                            if let NodeState::Established { ref session_key, .. } = state {
+                                if *session_key != [0u8; 32] {
+                                    seal_frame(&mut echo_frame, session_key, seq_tx, DIR_NODE_TO_HUB);
                                 }
                             }
-                        } else if echo && matches!(state, NodeState::Established { .. }) {
-                            // Echo: swap MACs, re-stamp seq, encrypt, send back
-                            if let Some(mut echo_frame) = build_echo_frame(&buf[..len], seq_tx) {
-                                // Seal if session has non-zero key
-                                if let NodeState::Established { ref session_key, .. } = state {
-                                    if *session_key != [0u8; 32] {
-                                        seal_frame(&mut echo_frame, session_key, seq_tx, DIR_NODE_TO_HUB);
-                                    }
-                                }
-                                seq_tx += 1;
-                                hexdump.dump_tx(&echo_frame, now);
-                                if sock.send(&echo_frame).is_ok() { tx_count += 1; }
-                            }
+                            seq_tx += 1;
+                            hexdump.dump_tx(&echo_frame, now);
+                            if sock.send(&echo_frame).is_ok() { tx_count += 1; }
                         }
                     }
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                       || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => {}
         }
 
         // === Sprint 6.3: Handshake timeout ===
@@ -1350,38 +1374,59 @@ fn run_udp_worker(hub_addr: &str, echo: bool, hexdump_mode: bool, mut tun: Optio
             if gc_counter % 5 == 0 { assembler.gc(now); }
         }
 
-        // === Sprint 6.3: TUN read (Ip -> M13) ===
+        // === Sprint S2: TUN drain batching (64/tick) + sendmmsg batch flush ===
         if let Some(ref mut tun_file) = tun {
             // Only forward if session established
             if let NodeState::Established { ref session_key, .. } = state {
-                // Try reading 1 packet
-                let mut tun_buf = [0u8; 1500];
-                match tun_file.read(&mut tun_buf) {
-                    Ok(n) if n > 0 => {
-                         // Encapsulate and send
-                         let hdr = build_m13_frame(&src_mac, &hub_mac, seq_tx, FLAG_TUNNEL);
-                         let mut frame = [0u8; 1600];
-                         frame[..62].copy_from_slice(&hdr);
-                         frame[62..62+n].copy_from_slice(&tun_buf[..n]);
-                         
-                         // Update payload length in header
-                         let plen = n as u32;
-                         frame[55..59].copy_from_slice(&plen.to_le_bytes());
-                         
-                         // Encrypt
-                         let flen = 62 + n;
-                         seal_frame(&mut frame[..flen], session_key, seq_tx, DIR_NODE_TO_HUB);
-                         
-                         seq_tx += 1;
-                         hexdump.dump_tx(&frame[..flen], now);
-                         if sock.send(&frame[..flen]).is_ok() {
-                             tx_count += 1;
+                // TX arrays pre-allocated outside loop — no per-tick memset.
+                let mut tx_count_batch: usize = 0;
 
-                         }
+                for _ in 0..TUN_BATCH {
+                    let frame = &mut tx_bufs[tx_count_batch];
+                    // Zero-copy TUN → tx_buf: read directly into payload region (offset 62)
+                    match tun_file.read(&mut frame[62..1562]) {
+                        Ok(n) if n > 0 => {
+                            // Stamp M13 header in-place (no intermediate build_m13_frame copy)
+                            frame[0..6].copy_from_slice(&hub_mac);
+                            frame[6..12].copy_from_slice(&src_mac);
+                            frame[12] = (ETH_P_M13 >> 8) as u8;
+                            frame[13] = (ETH_P_M13 & 0xFF) as u8;
+                            frame[14] = M13_WIRE_MAGIC;
+                            frame[15] = M13_WIRE_VERSION;
+                            // Zero signature bytes 16..46
+                            frame[16..46].fill(0);
+                            frame[46..54].copy_from_slice(&seq_tx.to_le_bytes());
+                            frame[54] = FLAG_TUNNEL;
+                            // Payload length
+                            frame[55..59].copy_from_slice(&(n as u32).to_le_bytes());
+                            // Pad remaining header bytes
+                            frame[59..62].fill(0);
+
+                            // Encrypt
+                            let flen = 62 + n;
+                            seal_frame(&mut frame[..flen], session_key, seq_tx, DIR_NODE_TO_HUB);
+
+                            seq_tx += 1;
+                            hexdump.dump_tx(&frame[..flen], now);
+                            tx_lens[tx_count_batch] = flen;
+                            tx_count_batch += 1;
+                        }
+                        _ => break, // WouldBlock or EOF — drain complete
                     }
-                    Ok(_) => {} // EOF?
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => eprintln!("[M13-TUN] Read error: {}", e),
+                }
+
+                // Batch flush via sendmmsg — single syscall for all TUN packets
+                if tx_count_batch > 0 {
+                    for i in 0..tx_count_batch {
+                        tx_iovecs[i].iov_base = tx_bufs[i].as_mut_ptr() as *mut libc::c_void;
+                        tx_iovecs[i].iov_len = tx_lens[i];
+                        tx_msgs[i].msg_hdr.msg_iov = &mut tx_iovecs[i] as *mut libc::iovec;
+                        tx_msgs[i].msg_hdr.msg_iovlen = 1;
+                    }
+                    let sent = unsafe {
+                        libc::sendmmsg(raw_fd, tx_msgs.as_mut_ptr(), tx_count_batch as u32, 0)
+                    };
+                    if sent > 0 { tx_count += sent as u64; }
                 }
             }
         }
@@ -1465,15 +1510,22 @@ fn run_afxdp_worker(if_name: &str, echo: bool, hexdump_mode: bool, mut tun: Opti
         engine.recycle_tx(&mut slab);
         engine.refill_rx(&mut slab);
 
-        // === Sprint 6.3: TUN read (Ip -> M13) ===
+        // === Sprint S2: TUN drain batching (64/tick) + batch commit/kick ===
         if let Some(ref mut tun_file) = tun {
             if let NodeState::Established { ref session_key, .. } = state {
-                let mut tun_buf = [0u8; 1500];
-                match tun_file.read(&mut tun_buf) {
-                    Ok(n) if n > 0 => {
-                        // Alloc slab
-                        if let Some(idx) = slab.alloc() {
-                            let buf = engine.get_frame_ptr(idx);
+                let mut tun_staged = 0u32;
+                for _ in 0..64u32 {
+                    // Sprint S2: Zero-copy TUN → UMEM. Speculatively alloc slab,
+                    // read TUN directly into payload region. No intermediate buffer.
+                    let idx = match slab.alloc() {
+                        Some(i) => i,
+                        None => break, // slab exhausted — stop draining
+                    };
+                    let buf = engine.get_frame_ptr(idx);
+                    let payload_ptr = unsafe { buf.add(ETH_HDR_SIZE + M13_HDR_SIZE) };
+                    let tun_slice = unsafe { std::slice::from_raw_parts_mut(payload_ptr, 1500) };
+                    match tun_file.read(tun_slice) {
+                        Ok(n) if n > 0 => {
                             let flen = ETH_HDR_SIZE + M13_HDR_SIZE + n;
                             unsafe {
                                 let eth = &mut *(buf as *mut EthernetHeader);
@@ -1487,28 +1539,29 @@ fn run_afxdp_worker(if_name: &str, echo: bool, hexdump_mode: bool, mut tun: Opti
                                 m13.seq_id = seq_tx;
                                 m13.flags = FLAG_TUNNEL;
                                 m13.payload_len = n as u32;
-                                
-                                // Copy payload
-                                let payload_ptr = buf.add(ETH_HDR_SIZE + M13_HDR_SIZE);
-                                std::ptr::copy_nonoverlapping(tun_buf.as_ptr(), payload_ptr, n);
-                                
+
+                                // Payload already in place — no copy needed.
                                 // Seal
                                 let frame_slice = std::slice::from_raw_parts_mut(buf, flen);
                                 seal_frame(frame_slice, session_key, seq_tx, DIR_NODE_TO_HUB);
                                 hexdump.dump_tx(frame_slice, now);
                             }
                             engine.tx_path.stage_tx(idx, flen as u32);
-                            engine.tx_path.commit_tx();
-                            engine.tx_path.kick_tx();
+                            tun_staged += 1;
                             seq_tx += 1;
                             tx_total += 1;
-                        } else {
-                            // Drop if slab full
+                        }
+                        _ => {
+                            // WouldBlock or EOF — free speculative slab, drain complete
+                            slab.free(idx);
+                            break;
                         }
                     }
-                    Ok(_) => {}
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => {}
+                }
+                // Single commit + kick for entire batch (was per-packet before)
+                if tun_staged > 0 {
+                    engine.tx_path.commit_tx();
+                    engine.tx_path.kick_tx();
                 }
             }
         }
@@ -1840,7 +1893,6 @@ fn calibrate_tsc() -> TscCal {
 // ============================================================================
 // TUNNELING
 // ============================================================================
-use std::os::unix::io::AsRawFd;
 use std::fs::OpenOptions;
 
 /// Discover the current default gateway IP and interface.
